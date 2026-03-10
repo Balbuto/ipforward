@@ -42,7 +42,7 @@ Production-ready CLI инструмент для управления прави
 
 ```bash
 # Скачать скрипт
-curl -O https://raw.githubusercontent.com/yourusername/ipforward/main/ipforward.sh
+curl -O https://github.com/Balbuto/ipforward/raw/refs/heads/main/ipforward.sh
 chmod +x ipforward.sh
 
 # Первый запуск (требуются права root)
@@ -62,7 +62,7 @@ sudo ipforward
 ## Ручная установка
 ```bash
 # Клонирование репозитория
-git clone https://github.com/yourusername/ipforward.git
+git clone https://github.com/Balbuto/ipforward.git
 cd ipforward
 
 # Копирование в систему
