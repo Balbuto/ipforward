@@ -4,7 +4,7 @@
 [![Bash](https://img.shields.io/badge/Bash-4.3%2B-green.svg)](https://www.gnu.org/software/bash/)
 [![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg)](https://www.kernel.org/)
 
-&gt; Production-ready CLI инструмент для управления правилами iptables port forwarding с атомарными операциями, автоматическим откатом и комплексными проверками безопасности.
+Production-ready CLI инструмент для управления правилами iptables port forwarding с атомарными операциями, автоматическим откатом и комплексными проверками безопасности.
 
 ---
 
