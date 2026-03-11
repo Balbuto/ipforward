@@ -1,4 +1,4 @@
-# 🚀 IPTables Forwarding Manager v1.0
+# 🚀 IPTables Forwarding Manager v1.01 Beta
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Bash](https://img.shields.io/badge/Bash-4.3%2B-green.svg)](https://www.gnu.org/software/bash/)
@@ -6,6 +6,16 @@
 
 Production-ready CLI инструмент для управления правилами iptables port forwarding с атомарными операциями, автоматическим откатом и комплексными проверками безопасности.
 
+
+## 🆕 Что нового в v1.01 Beta
+
+### Интеграция с Fail2Ban
+
+- 🛡️ **Автоматическое обнаружение** Fail2Ban при операции flush
+- 💾 **Бэкап правил Fail2Ban** перед сбросом iptables
+- 🔄 **Восстановление правил** после очистки (опционально)
+- ⏹️ **Корректная остановка** Fail2Ban перед flush
+- 📋 **Управление Fail2Ban** из отдельного меню (пункт 12)
 ---
 
 ## 📋 Описание
