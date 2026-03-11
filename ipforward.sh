@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================
-# IPTABLES FORWARDING MANAGER v1.01 (Beta)
+# IPTABLES FORWARDING MANAGER v3.5 (Fail2Ban Integration)
 # ==============================================
 set -euo pipefail
 
@@ -20,6 +20,7 @@ declare -r BACKUP_DIR="/root/iptables-backups"
 declare -r LOG_FILE="/var/log/port-forwarding.log"
 declare -r MAX_LOG_SIZE=10485760
 declare -r LOCK_FILE="/var/run/${SCRIPT_NAME}.lock"
+declare -r F2B_BACKUP_DIR="/root/iptables-backups/fail2ban"
 
 # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
 declare _lock_fd=""
@@ -157,6 +158,200 @@ backup_rules() {
     echo -e "${RED}❌ Ошибка бэкапа${NC}"
     return 1
 }
+
+# ==============================================
+# FAIL2BAN INTEGRATION FUNCTIONS
+# ==============================================
+
+is_fail2ban_installed() {
+    command -v fail2ban-client &> /dev/null && \
+    command -v fail2ban-server &> /dev/null
+}
+
+is_fail2ban_running() {
+    if is_fail2ban_installed; then
+        fail2ban-client ping &>/dev/null 2>&1
+        return $?
+    fi
+    return 1
+}
+
+get_fail2ban_chains() {
+    # Получаем список цепочек fail2ban из iptables
+    iptables -L 2>/dev/null | grep -E "^Chain f2b-|^Chain fail2ban" | awk '{print $2}' | sort -u
+}
+
+get_fail2ban_rules() {
+    # Сохраняем правила fail2ban в отдельный файл
+    local _output_file="$1"
+    local _chains
+    local _chain
+    
+    _chains=$(get_fail2ban_chains)
+    
+    if [[ -z "$_chains" ]]; then
+        return 1
+    fi
+    
+    # Создаём директорию для бэкапов fail2ban
+    if [[ ! -d "$F2B_BACKUP_DIR" ]]; then
+        mkdir -p "$F2B_BACKUP_DIR"
+        chmod 700 "$F2B_BACKUP_DIR"
+        chown root:root "$F2B_BACKUP_DIR" 2>/dev/null || true
+    fi
+    
+    # Сохраняем только fail2ban цепочки
+    {
+        echo "# Fail2Ban rules backup created: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# Chains: $_chains"
+        echo ""
+        
+        for _chain in $_chains; do
+            # Сохраняем правила цепочки
+            iptables -S "$_chain" 2>/dev/null || true
+            echo ""
+        done
+        
+        # Сохраняем ссылки на fail2ban цепочки из INPUT/FORWARD
+        iptables -S INPUT 2>/dev/null | grep -E "f2b-|fail2ban" || true
+        iptables -S FORWARD 2>/dev/null | grep -E "f2b-|fail2ban" || true
+    } > "$_output_file"
+    
+    chmod 600 "$_output_file"
+    return 0
+}
+
+restore_fail2ban_rules() {
+    local _backup_file="$1"
+    
+    if [[ ! -f "$_backup_file" ]]; then
+        log "WARN" "Fail2Ban backup file not found: $_backup_file"
+        return 1
+    fi
+    
+    echo -e "${YELLOW}[*] Восстановление правил Fail2Ban...${NC}"
+    
+    # Проверяем что fail2ban запущен, если нет — запускаем
+    if ! is_fail2ban_running; then
+        if is_fail2ban_installed; then
+            echo -e "${YELLOW}⚠️  Fail2Ban не запущен, попытка запуска...${NC}"
+            systemctl start fail2ban 2>/dev/null || service fail2ban start 2>/dev/null || true
+            sleep 2
+        fi
+    fi
+    
+    # Если fail2ban запущен — перезагружаем его правила корректно
+    if is_fail2ban_running; then
+        echo -e "${CYAN}Перезагрузка Fail2Ban через client...${NC}"
+        fail2ban-client reload 2>/dev/null || fail2ban-client restart 2>/dev/null || {
+            log "WARN" "Не удалось перезагрузить Fail2Ban через client"
+        }
+        return 0
+    fi
+    
+    # Если fail2ban не запущен или reload не сработал — восстанавливаем вручную
+    echo -e "${YELLOW}Восстановление правил вручную из бэкапа...${NC}"
+    
+    # Создаём цепочки если они не существуют
+    local _chains
+    _chains=$(grep "^-N f2b-" "$_backup_file" 2>/dev/null | awk '{print $2}' || true)
+    
+    for _chain in $_chains; do
+        if ! iptables -L "$_chain" -n &>/dev/null; then
+            iptables -N "$_chain" 2>/dev/null || true
+        fi
+    done
+    
+    # Применяем правила из бэкапа (кроме создания цепочек)
+    grep "^-A f2b-" "$_backup_file" 2>/dev/null | while read -r rule; do
+        eval "iptables $rule" 2>/dev/null || true
+    done
+    
+    # Восстанавливаем ссылки из INPUT
+    grep "^-A INPUT.*f2b-" "$_backup_file" 2>/dev/null | while read -r rule; do
+        # Проверяем что правило ещё не существует
+        local _chain_name
+        _chain_name=$(echo "$rule" | grep -oE 'f2b-[^[:space:]]+' | head -1)
+        if [[ -n "$_chain_name" ]]; then
+            if ! iptables -C INPUT -j "$_chain_name" &>/dev/null; then
+                eval "iptables $rule" 2>/dev/null || true
+            fi
+        fi
+    done
+    
+    log "INFO" "Fail2Ban rules restored from backup"
+    echo -e "${GREEN}✅ Правила Fail2Ban восстановлены${NC}"
+    return 0
+}
+
+unban_ip_fail2ban() {
+    # Разбан IP во всех jail'ах fail2ban
+    local _ip="$1"
+    
+    if ! is_fail2ban_running; then
+        return 1
+    fi
+    
+    local _jails
+    _jails=$(fail2ban-client status 2>/dev/null | grep "Jail list:" | sed 's/.*Jail list://' | tr ',' ' ' || true)
+    
+    for _jail in $_jails; do
+        _jail=$(echo "$_jail" | xargs)  # trim
+        [[ -z "$_jail" ]] && continue
+        fail2ban-client set "$_jail" unbanip "$_ip" &>/dev/null || true
+    done
+}
+
+ban_ip_fail2ban() {
+    # Бан IP во всех jail'ах fail2ban
+    local _ip="$1"
+    
+    if ! is_fail2ban_running; then
+        return 1
+    fi
+    
+    local _jails
+    _jails=$(fail2ban-client status 2>/dev/null | grep "Jail list:" | sed 's/.*Jail list://' | tr ',' ' ' || true)
+    
+    for _jail in $_jails; do
+        _jail=$(echo "$_jail" | xargs)  # trim
+        [[ -z "$_jail" ]] && continue
+        fail2ban-client set "$_jail" banip "$_ip" &>/dev/null || true
+    done
+}
+
+save_fail2ban_state() {
+    # Сохраняем текущее состояние fail2ban перед операциями
+    if ! is_fail2ban_running; then
+        return 0
+    fi
+    
+    local _state_file="$F2B_BACKUP_DIR/fail2ban-state-$(date +%Y%m%d-%H%M%S).txt"
+    
+    {
+        echo "# Fail2Ban state: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# Status:"
+        fail2ban-client status 2>/dev/null || true
+        echo ""
+        echo "# Banned IPs by jail:"
+        local _jails
+        _jails=$(fail2ban-client status 2>/dev/null | grep "Jail list:" | sed 's/.*Jail list://' | tr ',' ' ' || true)
+        for _jail in $_jails; do
+            _jail=$(echo "$_jail" | xargs)
+            [[ -z "$_jail" ]] && continue
+            echo ""
+            echo "[$_jail]"
+            fail2ban-client status "$_jail" 2>/dev/null | grep "Banned IP list:" || true
+        done
+    } > "$_state_file"
+    
+    chmod 600 "$_state_file"
+    log "INFO" "Fail2Ban state saved to $_state_file"
+}
+
+# ==============================================
+# CORE FUNCTIONS
+# ==============================================
 
 is_container() {
     [[ -f /.dockerenv ]] || \
@@ -352,6 +547,13 @@ prepare_system() {
         mkdir -p "$BACKUP_DIR"
         chmod 700 "$BACKUP_DIR"
         chown root:root "$BACKUP_DIR" 2>/dev/null || true
+    fi
+    
+    # Создаём директорию для бэкапов fail2ban
+    if [[ ! -d "$F2B_BACKUP_DIR" ]]; then
+        mkdir -p "$F2B_BACKUP_DIR"
+        chmod 700 "$F2B_BACKUP_DIR"
+        chown root:root "$F2B_BACKUP_DIR" 2>/dev/null || true
     fi
     
     [[ -d /etc/iptables ]] || mkdir -p /etc/iptables 2>/dev/null || true
@@ -684,6 +886,10 @@ delete_single_rule() {
     read -rp "Enter..."
 }
 
+# ==============================================
+# FAIL2BAN-AWARE FLUSH FUNCTION
+# ==============================================
+
 flush_rules() {
     echo -e "\n${RED}═══════════════════════════════════════════════════════════════${NC}"
     echo -e "${RED}!!! ВНИМАНИЕ !!! УДАЛЕНИЕ ВСЕХ ПРАВИЛ !!!${NC}"
@@ -694,7 +900,82 @@ flush_rules() {
     read -rp "Сделать бэкап? (y/n): " _bc
     [[ "$_bc" == "y" ]] && backup_rules || true
     
-    echo -e "${RED}⚠️  ВНИМАНИЕ: Это удалит ВСЕ правила INPUT/FORWARD/NAT!${NC}"
+    # === FAIL2BAN INTEGRATION ===
+    local _f2b_backup_file=""
+    local _f2b_was_running=0
+    local _f2b_chains=""
+    
+    if is_fail2ban_installed; then
+        echo -e "\n${CYAN}--- Проверка Fail2Ban ---${NC}"
+        
+        if is_fail2ban_running; then
+            _f2b_was_running=1
+            _f2b_chains=$(get_fail2ban_chains)
+            
+            if [[ -n "$_f2b_chains" ]]; then
+                echo -e "${YELLOW}⚠️  Обнаружен активный Fail2Ban со следующими цепочками:${NC}"
+                echo "$_f2b_chains" | while read -r chain; do
+                    echo -e "   ${CYAN}- $chain${NC}"
+                done
+                
+                # Сохраняем состояние fail2ban
+                save_fail2ban_state
+                
+                # Создаём бэкап правил iptables для fail2ban
+                _f2b_backup_file="$F2B_BACKUP_DIR/fail2ban-$(date +%Y%m%d-%H%M%S).rules"
+                if get_fail2ban_rules "$_f2b_backup_file"; then
+                    echo -e "${GREEN}✅ Бэкап Fail2Ban создан: $_f2b_backup_file${NC}"
+                    log "INFO" "Fail2Ban backup created before flush: $_f2b_backup_file"
+                else
+                    echo -e "${YELLOW}⚠️  Не удалось создать бэкап правил Fail2Ban${NC}"
+                    _f2b_backup_file=""
+                fi
+                
+                echo -e "\n${YELLOW}Варианты обработки Fail2Ban:${NC}"
+                echo -e "1) ${GREEN}Остановить Fail2Ban${NC} (рекомендуется) — правила будут удалены автоматически"
+                echo -e "2) ${CYAN}Сохранить и восстановить${NC} — попытка сохранить баны"
+                echo -e "3) ${RED}Пропустить${NC} — Fail2Ban правила будут потеряны!"
+                
+                read -rp "Выбор (1-3): " _f2b_choice
+                
+                case "$_f2b_choice" in
+                    1)
+                        echo -e "${YELLOW}Остановка Fail2Ban...${NC}"
+                        systemctl stop fail2ban 2>/dev/null || service fail2ban stop 2>/dev/null || true
+                        sleep 1
+                        if ! is_fail2ban_running; then
+                            echo -e "${GREEN}✅ Fail2Ban остановлен${NC}"
+                            _f2b_was_running=0
+                        else
+                            echo -e "${RED}❌ Не удалось остановить Fail2Ban${NC}"
+                        fi
+                        ;;
+                    2)
+                        echo -e "${CYAN}Fail2Ban правила будут восстановлены после очистки${NC}"
+                        ;;
+                    3)
+                        echo -e "${RED}⚠️  ПРЕДУПРЕЖДЕНИЕ: Fail2Ban правила будут потеряны!${NC}"
+                        read -rp "Продолжить? (yes/no): " _confirm
+                        [[ "$_confirm" != "yes" ]] && { echo -e "${GREEN}Отменено${NC}"; return; }
+                        _f2b_backup_file=""
+                        ;;
+                    *)
+                        echo -e "${RED}Неверный выбор, отмена операции${NC}"
+                        return
+                        ;;
+                esac
+            else
+                echo -e "${CYAN}Fail2Ban установлен, но нет активных цепочек в iptables${NC}"
+            fi
+        else
+            echo -e "${CYAN}Fail2Ban установлен, но не запущен${NC}"
+        fi
+    else
+        echo -e "${CYAN}Fail2Ban не обнаружен в системе${NC}"
+    fi
+    # === END FAIL2BAN INTEGRATION ===
+    
+    echo -e "\n${RED}⚠️  ВНИМАНИЕ: Это удалит ВСЕ правила INPUT/FORWARD/NAT!${NC}"
     echo -e "${RED}   Включая SSH и другие защитные правила!${NC}"
     echo -e "${YELLOW}   Убедитесь, что у вас есть альтернативный доступ (KVM/IPMI)${NC}"
     read -rp "Для продолжения введите 'DELETE ALL': " _c
@@ -702,8 +983,13 @@ flush_rules() {
     [[ "$_c" != "DELETE ALL" ]] && { echo -e "${GREEN}Отменено${NC}"; read -rp "Enter..."; return; }
     
     echo -e "${YELLOW}Очистка...${NC}"
-    log "WARN" "Очистка всех правил"
+    log "WARN" "Очистка всех правил (Fail2Ban backup: ${_f2b_backup_file:-none})"
     
+    # Сохраняем полный бэкап перед очисткой
+    local _full_backup="$BACKUP_DIR/iptables-pre-flush-$(date +%Y%m%d-%H%M%S).rules"
+    iptables-save > "$_full_backup" 2>/dev/null || true
+    
+    # Очистка правил
     iptables -w -t nat -F 2>/dev/null || true
     iptables -w -t mangle -F 2>/dev/null || true
     iptables -w -F FORWARD 2>/dev/null || true
@@ -712,9 +998,30 @@ flush_rules() {
     iptables -w -P INPUT ACCEPT 2>/dev/null || true
     iptables -w -P OUTPUT ACCEPT 2>/dev/null || true
     
-    command -v netfilter-persistent &> /dev/null && netfilter-persistent save >/dev/null 2>&1 || true
     echo -e "${GREEN}✅ Очищено (FORWARD=DROP, INPUT=ACCEPT)${NC}"
     log "INFO" "Очищено"
+    
+    # === RESTORE FAIL2BAN IF NEEDED ===
+    if [[ -n "$_f2b_backup_file" ]] && [[ "$_f2b_choice" == "2" ]]; then
+        echo -e "\n${CYAN}--- Восстановление Fail2Ban ---${NC}"
+        restore_fail2ban_rules "$_f2b_backup_file"
+        
+        # Перезапускаем fail2ban если он был запущен
+        if [[ $_f2b_was_running -eq 1 ]]; then
+            echo -e "${YELLOW}Перезапуск Fail2Ban...${NC}"
+            systemctl start fail2ban 2>/dev/null || service fail2ban start 2>/dev/null || true
+            sleep 2
+            if is_fail2ban_running; then
+                echo -e "${GREEN}✅ Fail2Ban перезапущен${NC}"
+            else
+                echo -e "${RED}⚠️  Не удалось перезапустить Fail2Ban${NC}"
+                echo -e "${YELLOW}   Попробуйте вручную: systemctl start fail2ban${NC}"
+            fi
+        fi
+    fi
+    # === END RESTORE ===
+    
+    command -v netfilter-persistent &> /dev/null && netfilter-persistent save >/dev/null 2>&1 || true
     
     read -rp "Enter..."
 }
@@ -778,24 +1085,198 @@ test_connection() {
     read -rp "Enter..."
 }
 
+# ==============================================
+# FAIL2BAN MANAGEMENT MENU
+# ==============================================
+
+show_fail2ban_menu() {
+    local _choice
+    while true; do
+        clear
+        echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${MAGENTA}║         FAIL2BAN ИНТЕГРАЦИЯ v1.0                             ║${NC}"
+        echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════════╝${NC}"
+        
+        if is_fail2ban_installed; then
+            if is_fail2ban_running; then
+                echo -e "${GREEN}● Статус: Запущен${NC}"
+                local _jails
+                _jails=$(fail2ban-client status 2>/dev/null | grep "Jail list:" | sed 's/.*Jail list://' | tr ',' '\n' | wc -l)
+                echo -e "${CYAN}● Активных jail'ов: $_jails${NC}"
+            else
+                echo -e "${YELLOW}● Статус: Остановлен${NC}"
+            fi
+        else
+            echo -e "${RED}● Статус: Не установлен${NC}"
+        fi
+        
+        echo ""
+        echo -e "1) ${CYAN}Показать статус${NC}"
+        echo -e "2) ${CYAN}Показать активные цепочки в iptables${NC}"
+        echo -e "3) ${GREEN}Запустить Fail2Ban${NC}"
+        echo -e "4) ${YELLOW}Остановить Fail2Ban${NC}"
+        echo -e "5) ${CYAN}Перезапустить Fail2Ban${NC}"
+        echo -e "6) ${CYAN}Создать бэкап правил${NC}"
+        echo -e "7) ${CYAN}Восстановить правила из бэкапа${NC}"
+        echo -e "8) ${CYAN}Показать забаненные IP${NC}"
+        echo -e "9) ${YELLOW}Разбанить IP${NC}"
+        echo -e "0) ${WHITE}Назад в главное меню${NC}"
+        echo -e "------------------------------------------------------"
+        read -rp "Выбор: " _choice
+        
+        case $_choice in
+            1)
+                if is_fail2ban_installed; then
+                    echo -e "\n${CYAN}--- Статус Fail2Ban ---${NC}"
+                    fail2ban-client status 2>/dev/null || echo -e "${RED}Не удалось получить статус${NC}"
+                else
+                    echo -e "${RED}Fail2Ban не установлен${NC}"
+                fi
+                read -rp "Enter..."
+                ;;
+            2)
+                echo -e "\n${CYAN}--- Цепочки Fail2Ban в iptables ---${NC}"
+                local _chains
+                _chains=$(get_fail2ban_chains)
+                if [[ -n "$_chains" ]]; then
+                    echo "$_chains" | while read -r chain; do
+                        echo -e "\n${YELLOW}Цепочка: $chain${NC}"
+                        iptables -L "$chain" -n --line-numbers 2>/dev/null | head -10 || echo "  (пусто)"
+                    done
+                else
+                    echo -e "${YELLOW}Цепочки Fail2Ban не найдены${NC}"
+                fi
+                read -rp "Enter..."
+                ;;
+            3)
+                if is_fail2ban_installed; then
+                    systemctl start fail2ban 2>/dev/null || service fail2ban start 2>/dev/null || true
+                    sleep 1
+                    if is_fail2ban_running; then
+                        echo -e "${GREEN}✅ Fail2Ban запущен${NC}"
+                    else
+                        echo -e "${RED}❌ Не удалось запустить${NC}"
+                    fi
+                else
+                    echo -e "${RED}Fail2Ban не установлен. Установите: apt install fail2ban${NC}"
+                fi
+                read -rp "Enter..."
+                ;;
+            4)
+                if is_fail2ban_running; then
+                    systemctl stop fail2ban 2>/dev/null || service fail2ban stop 2>/dev/null || true
+                    echo -e "${GREEN}✅ Fail2Ban остановлен${NC}"
+                else
+                    echo -e "${YELLOW}Fail2Ban уже остановлен${NC}"
+                fi
+                read -rp "Enter..."
+                ;;
+            5)
+                if is_fail2ban_installed; then
+                    systemctl restart fail2ban 2>/dev/null || service fail2ban restart 2>/dev/null || true
+                    sleep 2
+                    if is_fail2ban_running; then
+                        echo -e "${GREEN}✅ Fail2Ban перезапущен${NC}"
+                    else
+                        echo -e "${RED}❌ Не удалось перезапустить${NC}"
+                    fi
+                else
+                    echo -e "${RED}Fail2Ban не установлен${NC}"
+                fi
+                read -rp "Enter..."
+                ;;
+            6)
+                local _backup="$F2B_BACKUP_DIR/fail2ban-manual-$(date +%Y%m%d-%H%M%S).rules"
+                if get_fail2ban_rules "$_backup"; then
+                    echo -e "${GREEN}✅ Бэкап создан: $_backup${NC}"
+                else
+                    echo -e "${YELLOW}⚠️  Нет активных цепочек для бэкапа${NC}"
+                fi
+                read -rp "Enter..."
+                ;;
+            7)
+                echo -e "\n${CYAN}--- Доступные бэкапы ---${NC}"
+                if [[ -d "$F2B_BACKUP_DIR" ]]; then
+                    ls -1t "$F2B_BACKUP_DIR"/fail2ban-*.rules 2>/dev/null | head -10 | nl
+                    read -rp "Введите номер бэкапа (0 отмена): " _bnum
+                    if [[ "$_bnum" =~ ^[0-9]+$ ]] && [[ "$_bnum" -gt 0 ]]; then
+                        local _selected
+                        _selected=$(ls -1t "$F2B_BACKUP_DIR"/fail2ban-*.rules 2>/dev/null | head -10 | sed -n "${_bnum}p")
+                        if [[ -f "$_selected" ]]; then
+                            restore_fail2ban_rules "$_selected"
+                        else
+                            echo -e "${RED}Бэкап не найден${NC}"
+                        fi
+                    fi
+                else
+                    echo -e "${YELLOW}Директория бэкапов не найдена${NC}"
+                fi
+                read -rp "Enter..."
+                ;;
+            8)
+                if is_fail2ban_running; then
+                    echo -e "\n${CYAN}--- Забаненные IP ---${NC}"
+                    local _jails
+                    _jails=$(fail2ban-client status 2>/dev/null | grep "Jail list:" | sed 's/.*Jail list://' | tr ',' ' ' || true)
+                    for _jail in $_jails; do
+                        _jail=$(echo "$_jail" | xargs)
+                        [[ -z "$_jail" ]] && continue
+                        echo -e "\n${YELLOW}[$_jail]${NC}"
+                        fail2ban-client status "$_jail" 2>/dev/null | grep "Currently banned:" || echo "  Нет данных"
+                    done
+                else
+                    echo -e "${YELLOW}Fail2Ban не запущен${NC}"
+                fi
+                read -rp "Enter..."
+                ;;
+            9)
+                if is_fail2ban_running; then
+                    read -rp "Введите IP для разбана: " _unban_ip
+                    if [[ -n "$_unban_ip" ]]; then
+                        unban_ip_fail2ban "$_unban_ip"
+                        echo -e "${GREEN}✅ IP $_unban_ip разбанен (если был в jail'ах)${NC}"
+                    fi
+                else
+                    echo -e "${YELLOW}Fail2Ban не запущен${NC}"
+                fi
+                read -rp "Enter..."
+                ;;
+            0) return ;;
+            *) echo -e "${RED}Ошибка! Неверный пункт меню${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
 show_menu() {
     local _choice
     while true; do
         clear
         echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║         IPTABLES FORWARDING MANAGER v1.0 (Final)              ║${NC}"
+        echo -e "${CYAN}║         IPTABLES FORWARDING MANAGER v3.5 (Fail2Ban)           ║${NC}"
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-        echo -e "\n1) ${GREEN}AmneziaWG/WireGuard${NC} (UDP)"
+        
+        # Показываем статус Fail2Ban если установлен
+        if is_fail2ban_installed; then
+            if is_fail2ban_running; then
+                echo -e "${GREEN}● Fail2Ban: активен${NC}"
+            else
+                echo -e "${YELLOW}● Fail2Ban: неактивен${NC}"
+            fi
+        fi
+        
+        echo ""
+        echo -e "1) ${GREEN}AmneziaWG/WireGuard${NC} (UDP)"
         echo -e "2) ${GREEN}VLESS/XRay${NC} (TCP)"
         echo -e "3) ${GREEN}TProxy/MTProto${NC} (TCP)"
         echo -e "4) ${GREEN}WireGuard Full${NC} (UDP+TCP fallback)"
         echo -e "5) ${YELLOW}🛠 Кастомное${NC}"
         echo -e "6) ${CYAN}📋 Список правил${NC}"
         echo -e "7) ${RED}🗑 Удалить правило${NC}"
-        echo -e "8) ${RED}⚠️  Сброс ВСЕХ правил${NC}"
+        echo -e "8) ${RED}⚠️  Сброс ВСЕХ правил${NC} (с защитой Fail2Ban)"
         echo -e "9) ${MAGENTA}📚 Инструкция${NC}"
         echo -e "10) ${BLUE}📊 Статистика${NC}"
         echo -e "11) ${BLUE}🔌 Проверка соединения${NC}"
+        echo -e "12) ${MAGENTA}🛡️  Fail2Ban меню${NC}"
         echo -e "0) ${WHITE}Выход${NC}"
         echo -e "------------------------------------------------------"
         read -rp "Выбор: " _choice
@@ -811,6 +1292,7 @@ show_menu() {
             9) show_instructions ;;
             10) show_statistics ;;
             11) test_connection ;;
+            12) show_fail2ban_menu ;;
             0) echo -e "${GREEN}Пока!${NC}"; log "INFO" "Завершён"; exit 0 ;;
             *) echo -e "${RED}Ошибка! Неверный пункт меню${NC}"; sleep 1 ;;
         esac
@@ -826,9 +1308,12 @@ main() {
     prepare_system
     clear
     echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${GREEN}║     IPTABLES FORWARDING MANAGER v1.0                          ║${NC}"
+    echo -e "${GREEN}║     IPTABLES FORWARDING MANAGER v3.5 (Fail2Ban)               ║${NC}"
     echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo -e "${YELLOW}Лог: $LOG_FILE${NC}\n${YELLOW}Бэкапы: $BACKUP_DIR${NC}"
+    if is_fail2ban_installed; then
+        echo -e "${MAGENTA}Fail2Ban интеграция: активна${NC}"
+    fi
     sleep 1
     show_menu
 }
