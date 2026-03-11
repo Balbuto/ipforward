@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================
-# IPTABLES FORWARDING MANAGER v3.5 (Fail2Ban Integration)
+# IPTABLES FORWARDING MANAGER v1.1 (Fail2Ban Integration)
 # ==============================================
 set -euo pipefail
 
@@ -1252,7 +1252,7 @@ show_menu() {
     while true; do
         clear
         echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║         IPTABLES FORWARDING MANAGER v3.5 (Fail2Ban)           ║${NC}"
+        echo -e "${CYAN}║         IPTABLES FORWARDING MANAGER v1.1 (Fail2Ban)           ║${NC}"
         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
         
         # Показываем статус Fail2Ban если установлен
