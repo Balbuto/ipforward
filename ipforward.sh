@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================
-# IPTABLES FORWARDING MANAGER v1.0 (Production Final)
+# IPTABLES FORWARDING MANAGER v1.01 (Beta)
 # ==============================================
 set -euo pipefail
 
