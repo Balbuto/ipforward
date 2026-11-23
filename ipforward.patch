@@ -1,0 +1,1731 @@
+--- a/ipforward.sh
++++ b/ipforward.sh
+@@ -1,8 +1,47 @@
+ #!/bin/bash
+ # ==============================================
+-# IPTABLES FORWARDING MANAGER v1.0 (Production Final)
++# IPTABLES FORWARDING MANAGER v1.1.0
+ # ==============================================
+-set -euo pipefail
++# Исправления относительно v1.0 (Balbuto/ipforward). Полный разбор — docs/AUDIT.md.
++# Нумерация ниже совпадает с номерами дефектов в отчёте и с метками FIX #N в коде.
++#   Критические:
++#   1.  validate_ip()/validate_target(): "local _IFS='.'" не менял IFS —
++#       ЛЮБОЙ IP отклонялся. Создание правил было невозможно в принципе.
++#   2.  validate_target(): $((10#...)) на строке IP — фатальная ошибка
++#       арифметики при вызове.
++#   3.  set -e убивал скрипт при любом отказе операции — меню закрывалось.
++#   4.  read при EOF (Ctrl-D / пайп) → busy-loop "Пустой ввод" в 100% CPU.
++#   5.  check_port_available(): шаблон ":::" не совпадал никогда — занятый
++#       IPv6-портом порт считался свободным.
++#   6.  check_rule_exists()/delete: -C без "-t nat" смотрел таблицу filter —
++#       "Перезаписать" не удалял старое правило, появлялись два DNAT.
++#   7.  удаление правила с диапазоном портов (--dport 40000:50000) рапортовало
++#       об успехе, но правило оставалось.
++#   8.  flush_rules(): двойная пауза; бэкап создавался даже при ответе "n".
++#   9.  backup_rules(): при сбое iptables-save статус терялся; на одну
++#       операцию делалось 2-3 бэкапа.
++#   10. lock удалялся вторым экземпляром — защита от параллельного запуска
++#       переставала работать.
++#   11. повторное применение копило дубли INPUT/FORWARD/MASQUERADE.
++#   12. можно было создать два DNAT на один порт с разными целями.
++#   Серьёзные:
++#   13. "WireGuard Full": вложенный вопрос + откат сносил ЧУЖОЕ правило.
++#   14. Откат "WireGuard Full" удалял существовавшее правило пользователя.
++#   15. Статистика: без -x счётчики "12K" не суммировались, spt — порт.
++#   16. parse_nat_rules(): диапазоны портов и цель без порта.
++#   17. Двойной вопрос "Перезаписать?" в кастомном правиле.
++#   18. UFW: логика ответа "n" через "A && B || C".
++#   19. is_container(): результат зависел от последнего звена ||-цепочки.
++#   20. MASQUERADE вешался безусловно при каждом правиле.
++#   21. validate_port() падал на ведущих нулях ("08").
++#   22. prepare_system(): cp самого себя при каждом запуске.
++#   23. Мелочи: clear в non-tty, log() при set -e, разные форматы таблиц,
++#       рассинхрон версий в коде/меню/README.
++#   Дополнительно найдено при написании тестов (v1.1.0):
++#   24. backup_rules(): имя файла с точностью до секунды — два применения
++#       подряд затирали предыдущий бэкап.
++#   25. backup_rules(): при сбое iptables-save оставался пустой файл-мусор.
++set -uo pipefail
+ 
+ # --- ЦВЕТА ---
+ declare -r RED='\033[0;31m'
+@@ -15,14 +54,20 @@
+ declare -r NC='\033[0m'
+ 
+ # --- КОНФИГУРАЦИЯ ---
++declare -r SCRIPT_VERSION="1.1.0"
+ declare -r SCRIPT_NAME="ipforward"
+ declare -r BACKUP_DIR="/root/iptables-backups"
++declare -r REPO_URL="https://github.com/Balbuto/ipforward"
+ declare -r LOG_FILE="/var/log/port-forwarding.log"
+ declare -r MAX_LOG_SIZE=10485760
+ declare -r LOCK_FILE="/var/run/${SCRIPT_NAME}.lock"
+ 
+ # --- ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ---
+ declare _lock_fd=""
++declare _lock_owned=0
++# Если файл подключают через source (тесты) — main() не запускается.
++declare _IPFORWARD_SOURCED=0
++[[ "${BASH_SOURCE[0]}" != "$0" ]] && _IPFORWARD_SOURCED=1
+ 
+ # ==============================================
+ # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+@@ -33,20 +78,19 @@
+     local _log_message="$2"
+     local _log_timestamp
+     _log_timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+-    echo -e "[${_log_timestamp}] [${_log_level}] ${_log_message}" >> "$LOG_FILE"
++    echo -e "[${_log_timestamp}] [${_log_level}] ${_log_message}" >> "$LOG_FILE" 2>/dev/null || true
+ }
+ 
+ cleanup() {
+     local _exit_code=$?
+-    # Закрываем lock file descriptor
+-    if [[ -n "$_lock_fd" ]]; then
+-        exec {_lock_fd}>&- 2>/dev/null || true
+-    fi
+-    # Удаляем lock файл при выходе
+-    if [[ -f "$LOCK_FILE" ]]; then
++    # FIX #10: удаляем lock, только если реально мы его захватили
++    if [[ "$_lock_owned" -eq 1 ]]; then
++        if [[ -n "$_lock_fd" ]]; then
++            exec {_lock_fd}>&- 2>/dev/null || true
++        fi
+         rm -f "$LOCK_FILE" 2>/dev/null || true
+     fi
+-    exit $_exit_code
++    exit "$_exit_code"
+ }
+ 
+ check_root() {
+@@ -66,22 +110,25 @@
+ acquire_lock() {
+     exec {_lock_fd}>"$LOCK_FILE"
+     if ! flock -n "$_lock_fd"; then
+-        echo -e "${RED}[ERROR] Скрипт уже запущен${NC}"
++        echo -e "${RED}[ERROR] Скрипт уже запущен (lock: $LOCK_FILE)${NC}"
+         _lock_fd=""
+         exit 1
+     fi
++    _lock_owned=1
+ }
+ 
+ set_file_permissions() {
+     local _file="$1"
+     local _mode="$2"
+     local _chmod_ok=0
+-    local _chown_ok=0
+-    
++
+     if [[ -f "$_file" ]]; then
+-        chmod "$_mode" "$_file" 2>/dev/null && _chmod_ok=1 || log "WARN" "Не удалось chmod $_file"
+-        chown root:root "$_file" 2>/dev/null && _chown_ok=1 || log "WARN" "Не удалось chown $_file"
+-        
++        if chmod "$_mode" "$_file" 2>/dev/null; then
++            _chmod_ok=1
++        else
++            log "WARN" "Не удалось chmod $_file"
++        fi
++        chown root:root "$_file" 2>/dev/null || log "WARN" "Не удалось chown $_file"
+         [[ $_chmod_ok -eq 1 ]] && return 0 || return 1
+     fi
+     return 0
+@@ -90,18 +137,19 @@
+ check_dependencies() {
+     local _deps=("iptables" "ip" "grep" "awk" "sed" "ss" "nc" "timeout" "readlink" "stat")
+     local _missing=()
+-    
++    local _dep
++
+     for _dep in "${_deps[@]}"; do
+         command -v "$_dep" &> /dev/null || _missing+=("$_dep")
+     done
+-    
++
+     if [[ ${#_missing[@]} -gt 0 ]]; then
+         echo -e "${YELLOW}Устанавливаю: ${_missing[*]}${NC}"
+         export DEBIAN_FRONTEND=noninteractive
+-        
++
+         echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections 2>/dev/null || true
+         echo "iptables-persistent iptables-persistent/autosave_v6 boolean false" | debconf-set-selections 2>/dev/null || true
+-        
++
+         apt-get update -y > /dev/null 2>&1 || true
+         apt-get install -y \
+             iptables \
+@@ -115,28 +163,51 @@
+             exit 1
+         }
+     fi
+-    
++
+     local _critical=("iptables" "iptables-save" "ip" "ss" "nc" "timeout")
+-    for _cmd in "${_critical[@]}"; do
+-        command -v "$_cmd" &> /dev/null || {
+-            echo -e "${RED}Критическая зависимость отсутствует: $_cmd${NC}"
++    for _dep in "${_critical[@]}"; do
++        command -v "$_dep" &> /dev/null || {
++            echo -e "${RED}Критическая зависимость отсутствует: $_dep${NC}"
+             exit 1
+         }
+     done
+ }
+ 
++persist_rules() {
++    # FIX: единая точка сохранения (раньше логика была скопирована в 3 местах
++    #      с разным поведением: где-то "|| true", где-то падение).
++    if command -v netfilter-persistent &> /dev/null; then
++        netfilter-persistent save > /dev/null 2>&1 && return 0
++    fi
++    if command -v iptables-save &> /dev/null; then
++        mkdir -p /etc/iptables 2>/dev/null || true
++        iptables-save > /etc/iptables/rules.v4 2>/dev/null && return 0
++    fi
++    log "WARN" "Не удалось сохранить правила между перезагрузками"
++    return 1
++}
++
+ backup_rules() {
+     local _old_umask
+     _old_umask=$(umask)
+     umask 077
+-    
++
+     if [[ ! -d "$BACKUP_DIR" ]]; then
+         mkdir -p "$BACKUP_DIR"
+         chmod 700 "$BACKUP_DIR"
+         chown root:root "$BACKUP_DIR" 2>/dev/null || true
+     fi
+-    
+-    local _backup_file="$BACKUP_DIR/iptables-$(date +%Y%m%d-%H%M%S).rules"
++
++    local _backup_file _base _n
++    _base="$BACKUP_DIR/iptables-$(date +%Y%m%d-%H%M%S)"
++    _backup_file="${_base}.rules"
++    # FIX #24: имена бэкапов уникальны, даже если два применения попали в одну
++    # секунду — иначе второй бэкап молча затирает первый.
++    _n=1
++    while [[ -e "$_backup_file" ]]; do
++        _backup_file="${_base}-${_n}.rules"
++        _n=$((_n + 1))
++    done
+     if command -v iptables-save &> /dev/null; then
+         if iptables-save > "$_backup_file" 2>/dev/null; then
+             if [[ -s "$_backup_file" ]] && grep -q "^\*" "$_backup_file" 2>/dev/null; then
+@@ -150,134 +221,201 @@
+                 rm -f "$_backup_file" 2>/dev/null || true
+                 echo -e "${RED}❌ Бэкап пустой или невалидный${NC}"
+             fi
++        else
++            # FIX #25: iptables-save упал — не оставляем пустой файл-мусор
++            rm -f "$_backup_file" 2>/dev/null || true
+         fi
+     fi
+-    
++
+     umask "$_old_umask"
+-    echo -e "${RED}❌ Ошибка бэкапа${NC}"
++    # FIX #9: честный код возврата — вызывающий код решает, продолжать ли
++    echo -e "${RED}❌ Ошибка бэкапа (правила не сохранены)${NC}"
++    log "WARN" "Бэкап не создан"
+     return 1
+ }
+ 
+ is_container() {
+-    [[ -f /.dockerenv ]] || \
+-    [[ -f /proc/vz/version ]] || \
+-    [[ "$(cat /proc/1/cgroup 2>/dev/null)" =~ docker ]] || \
+-    [[ "$(systemd-detect-virt 2>/dev/null)" =~ lxc|openvz ]]
++    # FIX #19: явные return, безопасные подстановки
++    # FIX: явные return вместо цепочки ||, значение которой зависит от последнего звена
++    if [[ -f /.dockerenv ]] || [[ -f /proc/vz/version ]]; then
++        return 0
++    fi
++    if [[ "$(cat /proc/1/cgroup 2>/dev/null)" =~ docker ]]; then
++        return 0
++    fi
++    if [[ "$(systemd-detect-virt 2>/dev/null)" =~ lxc|openvz ]]; then
++        return 0
++    fi
++    return 1
+ }
+ 
+ get_default_interface() {
+     local _iface=""
+     _iface=$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)
+-    
++
+     if [[ -z "$_iface" ]]; then
+         _iface=$(ip -4 -o addr show 2>/dev/null | grep -v -E 'lo:|docker|br-|veth|tun|wg|vmbr|virbr' | awk '{print $2}' | head -1)
+     fi
+-    
++
+     if [[ -n "$_iface" ]] && ip link show "$_iface" &>/dev/null; then
+         echo "$_iface"
+         return 0
+     fi
+-    
++
+     log "ERROR" "Не удалось определить интерфейс"
+     return 1
+ }
+ 
+ check_port_available() {
++    # 0 — свободен, 1 — занят, 2 — некорректный порт
+     local _port="$1"
+     local _proto="$2"
+-    
+-    if ! [[ "$_port" =~ ^[0-9]+$ ]] || [[ "$_port" -lt 1 ]] || [[ "$_port" -gt 65535 ]]; then
++    local _listen_addr=""
++
++    if ! [[ "$_port" =~ ^[0-9]+$ ]] || (( 10#$_port < 1 || 10#$_port > 65535 )); then
+         return 2
+     fi
+-    
+-    if ss -tuln 2>/dev/null | grep -qE "${_proto}.*(0\.0\.0\.0|:::|\*):${_port}\s"; then
+-        return 1
+-    fi
++
++    # FIX #5: старый шаблон ":::" не мог совпасть ни с чем, поэтому занятый
++    # IPv6-портом ([::]:PORT) порт выглядел свободным. Сравниваем точно.
++    while read -r _listen_addr; do
++        [[ -z "$_listen_addr" ]] && continue
++        if [[ "$_listen_addr" =~ :${_port}$ ]]; then
++            return 1
++        fi
++    done < <(ss -H -tuln 2>/dev/null | awk -v p="$_proto" '$1==p {print $5}')
++
+     return 0
+ }
+ 
+ validate_ip() {
+     local _ip="$1"
+-    local _IFS='.'
+     local -a _octets=()
+-    
++    local _octet
++    local _first _second
++
+     [[ -z "$_ip" ]] && return 1
+     [[ "$_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+-    read -ra _octets <<< "$_ip"
++
++    # FIX #1: раньше здесь стояло "local _IFS='.'" — это НЕ меняет IFS,
++    # поэтому read возвращал весь адрес одной строкой, и проверка
++    # "${#_octets[@]} -eq 4" всегда падала. Любой IP отклонялся.
++    IFS='.' read -ra _octets <<< "$_ip"
+     [[ ${#_octets[@]} -eq 4 ]] || return 1
+-    
++
+     for _octet in "${_octets[@]}"; do
+         [[ "$_octet" =~ ^[0-9]+$ ]] || return 1
+         _octet=$((10#$_octet))
+-        ((_octet >= 0 && _octet <= 255)) || return 1
++        (( _octet >= 0 && _octet <= 255 )) || return 1
+     done
+-    
+-    local _first="${_octets[0]}"
+-    local _second="${_octets[1]}"
+-    
+-    [[ $_first -eq 0 ]] && return 1
+-    [[ $_first -eq 127 ]] && return 1
+-    [[ $_first -ge 224 ]] && return 1
+-    [[ $_first -eq 255 ]] && return 1
+-    [[ $_first -eq 169 && $_second -eq 254 ]] && return 1
+-    
++
++    _first=$((10#${_octets[0]}))
++    _second=$((10#${_octets[1]}))
++
++    [[ $_first -eq 0 ]] && return 1                      # 0.0.0.0/8
++    [[ $_first -eq 127 ]] && return 1                    # loopback
++    [[ $_first -ge 224 ]] && return 1                    # multicast/reserved/broadcast
++    [[ $_first -eq 169 && $_second -eq 254 ]] && return 1 # link-local
++
+     return 0
+ }
+ 
++validate_port() {
++    # FIX #21: 10# — ведущие нули не ломают арифметику
++    local _port="$1"
++    [[ -n "$_port" ]] && [[ "$_port" =~ ^[0-9]+$ ]] && (( 10#$_port >= 1 && 10#$_port <= 65535 ))
++}
++
+ validate_target() {
+     local _target="$1"
++
+     [[ "$_target" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]] || return 1
+-    
+-    local _ip="${_target%:*}"
+-    local _port="${_target#*:}"
+-    local _IFS='.'
+-    local -a _octets=()
+-    read -ra _octets <<< "$_ip"
+-    
+-    for _octet in "${_octets[@]}"; do
+-        _octet=$((10#$_octet))
+-        ((_octet >= 0 && _octet <= 255)) || return 1
+-    done
+-    
+-    _port=$((10#$_port))
+-    ((_port >= 1 && _port <= 65535)) || return 1
+-    
+-    return 0
+-}
+ 
+-validate_port() {
+-    local _port="$1"
+-    [[ -n "$_port" ]] && [[ "$_port" =~ ^[0-9]+$ ]] && [[ "$_port" -ge 1 ]] && [[ "$_port" -le 65535 ]]
++    # FIX #2: сначала проверяем октеты валидатором, и только потом арифметику.
++    # В v1.0 "$((10#$octet))" вызывался на строке вида "203.0.113.50" и
++    # валил скрипт: "syntax error: invalid arithmetic operator".
++    validate_ip "${_target%:*}" || return 1
++    validate_port "${_target##*:}" || return 1
++
++    return 0
+ }
+ 
+ check_rule_exists() {
+     local _proto="$1"
+     local _port="$2"
+     local _target="$3"
++    # FIX #6: -t nat обязателен и в -C, и в -D. Без него iptables проверяет
++    # таблицу filter и правило никогда не находится (из-за этого "перезапись"
++    # не удаляла старое правило, а откат "успешно" удалял его).
+     iptables -w -t nat -C PREROUTING -p "$_proto" --dport "$_port" -j DNAT --to-destination "$_target" &>/dev/null
+ }
+ 
++find_conflicting_dnat() {
++    # FIX #12: раньше можно было создать ВТОРОЕ правило DNAT на тот же
++    # входящий порт с другой целью; трафик уходил по первому совпадению.
++    # Возвращает цель конфликтующего правила (или пусто), только для того же протокола.
++    local _proto="$1"
++    local _port="$2"
++    local _target="$3"
++    local _line _c_proto _c_dport _c_dest
++
++    while IFS= read -r _line; do
++        [[ "$_line" != *"DNAT"* ]] && continue
++        if [[ "$_line" =~ -p[[:space:]]+([^[:space:]]+).*--dport[[:space:]]+([0-9]+(:[0-9]+)?)[[:space:]]+.*--to-destination[[:space:]]+([0-9.]+(:[0-9]+)?) ]]; then
++            _c_proto="${BASH_REMATCH[1]}"
++            _c_dport="${BASH_REMATCH[2]}"
++            _c_dest="${BASH_REMATCH[4]}"
++            [[ "$_c_dest" != *":"* ]] && _c_dest="${_c_dest}:${_c_dport%%:*}"
++            if [[ "$_c_proto" == "$_proto" && "$_c_dport" == "$_port" && "$_c_dest" != "$_target" ]]; then
++                echo "$_c_dest"
++                return 0
++            fi
++        fi
++    done < <(iptables-save -t nat 2>/dev/null)
++    return 1
++}
++
++add_rule_once() {
++    # FIX #11: идемпотентное добавление, чтобы повторный запуск не копил дубли.
++    # Аргументы: table chain [правило...]
++    local _table="$1"; shift
++    local _chain="$1"; shift
++
++    if iptables -w -t "$_table" -C "$_chain" "$@" &>/dev/null; then
++        return 0
++    fi
++    iptables -w -t "$_table" -A "$_chain" "$@"
++}
++
+ parse_nat_rules() {
++    # FIX #7, #16: парсер понимает диапазоны портов a:b и цель без порта
++    # Заполняет два массива: "proto|dport|dest" и сырые строки iptables-save.
+     local -n ___pr_rules_array=$1
+     local -n ___pr_raw_array=$2
+-    
++
+     local ___pr_i=1
+     local ___pr_output
+-    
++
+     ___pr_output=$(iptables-save -t nat 2>/dev/null) || return 1
+-    
++
+     while IFS= read -r ___pr_line; do
+         [[ "$___pr_line" != *"DNAT"* ]] && continue
+-        
++
+         local ___pr_proto ___pr_dport ___pr_dest
+-        if [[ "$___pr_line" =~ -p[[:space:]]+([^[:space:]]+).*--dport[[:space:]]+([0-9]+).*--to-destination[[:space:]]+([0-9.:]+) ]]; then
++        # FIX #15: допускаем диапазон портов "--dport 40000:50000" и адрес
++        # назначения без порта (тогда проставляем порт из dport).
++        if [[ "$___pr_line" =~ -p[[:space:]]+([^[:space:]]+).*--dport[[:space:]]+([0-9]+(:[0-9]+)?)[[:space:]]+.*--to-destination[[:space:]]+([0-9.]+(:[0-9]+)?) ]]; then
+             ___pr_proto="${BASH_REMATCH[1]}"
+             ___pr_dport="${BASH_REMATCH[2]}"
+-            ___pr_dest="${BASH_REMATCH[3]}"
+-            
+-            ___pr_rules_array[$___pr_i]="$___pr_proto:$___pr_dport:$___pr_dest"
+-            ___pr_raw_array[$___pr_i]="$___pr_line"
+-            ((___pr_i++)) || true
++            ___pr_dest="${BASH_REMATCH[4]}"
++
++            if [[ "$___pr_dest" != *":"* ]]; then
++                ___pr_dest="${___pr_dest}:${___pr_dport%%:*}"
++            fi
++
++            ___pr_rules_array[___pr_i]="${___pr_proto}|${___pr_dport}|${___pr_dest}"
++            ___pr_raw_array[___pr_i]="$___pr_line"
++            (( ___pr_i++ )) || true
+         fi
+     done <<< "$___pr_output"
+ }
+@@ -287,12 +425,12 @@
+         log "INFO" "Контейнер обнаружен, пропускаем BBR"
+         return 0
+     fi
+-    
++
+     if modprobe tcp_bbr 2>/dev/null; then
+         if [[ -d /etc/modules-load.d ]]; then
+             echo "tcp_bbr" > /etc/modules-load.d/bbr.conf 2>/dev/null || true
+         fi
+-        
++
+         sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf 2>/dev/null || true
+         sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf 2>/dev/null || true
+         echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+@@ -307,7 +445,7 @@
+     if [[ -f "$LOG_FILE" ]]; then
+         local _log_size
+         _log_size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+-        if [[ "$_log_size" -gt $MAX_LOG_SIZE ]]; then
++        if (( _log_size > MAX_LOG_SIZE )); then
+             local _old_umask
+             _old_umask=$(umask)
+             umask 077
+@@ -321,45 +459,49 @@
+ }
+ 
+ prepare_system() {
++    # FIX #22: cp только при изменении, единый persist_rules()
+     setup_log_rotation
+     log "INFO" "Подготовка системы"
+-    
++
+     local _script_path
+     _script_path=$(readlink -f "$0" 2>/dev/null) || _script_path="$0"
+-    
++
+     if [[ -f "$_script_path" ]] && [[ "$_script_path" != "/usr/local/bin/$SCRIPT_NAME" ]]; then
+-        if cp -f "$_script_path" "/usr/local/bin/$SCRIPT_NAME" 2>/dev/null; then
++        # FIX: не перезаписываем установленную команду без надобности
++        if [[ -f "/usr/local/bin/$SCRIPT_NAME" ]] && cmp -s "$_script_path" "/usr/local/bin/$SCRIPT_NAME"; then
++            :
++        elif cp -f "$_script_path" "/usr/local/bin/$SCRIPT_NAME" 2>/dev/null; then
+             chmod +x "/usr/local/bin/$SCRIPT_NAME"
+             echo -e "${GREEN}✅ Команда: $SCRIPT_NAME${NC}"
+         else
+             echo -e "${YELLOW}⚠️  Не удалось создать команду${NC}"
+         fi
+     fi
+-    
++
+     sysctl -w net.ipv4.ip_forward=1 &>/dev/null || true
+     sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null || true
+     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+-    
++
+     enable_bbr || true
+     sysctl -p &>/dev/null || true
+-    
++
+     check_dependencies
+-    
++
+     touch "$LOG_FILE" 2>/dev/null || true
+     set_file_permissions "$LOG_FILE" "600" || true
+-    
++
+     if [[ ! -d "$BACKUP_DIR" ]]; then
+         mkdir -p "$BACKUP_DIR"
+         chmod 700 "$BACKUP_DIR"
+         chown root:root "$BACKUP_DIR" 2>/dev/null || true
+     fi
+-    
++
+     [[ -d /etc/iptables ]] || mkdir -p /etc/iptables 2>/dev/null || true
+     log "INFO" "Система готова"
+ }
+ 
+ show_instructions() {
+-    clear
++    clear 2>/dev/null || true
+     echo -e "${MAGENTA}╔══════════════════════════════════════════════════════════════╗${NC}"
+     echo -e "${MAGENTA}║             📚 ИНСТРУКЦИЯ                                    ║${NC}"
+     echo -e "${MAGENTA}╚══════════════════════════════════════════════════════════════╝${NC}"
+@@ -368,34 +510,37 @@
+     echo -e "${CYAN}2. Выберите пункт меню 1-5 и введите данные${NC}"
+     echo -e "${CYAN}3. В клиенте укажите IP ЭТОГО сервера и входящий порт${NC}"
+     echo ""
+-    read -rp "Нажмите Enter..."
++    read -rp "Нажмите Enter..." _ || true
+ }
+ 
+ delete_rule_by_params() {
++    # Удаляет DNAT + INPUT + FORWARD (+ служебный MASQUERADE-lo).
+     local _proto="$1"
+     local _port="$2"
+     local _target="$3"
+-    
++
+     if [[ "$_target" != *":"* ]]; then
+         log "ERROR" "Некорректный target: $_target"
+         return 1
+     fi
+-    
++
+     local _target_ip="${_target%:*}"
+-    local _target_port="${_target#*:}"
++    local _target_port="${_target##*:}"
+     local _rule_existed=0
+     local _rule_deleted=0
+-    
++
+     if iptables -w -t nat -C PREROUTING -p "$_proto" --dport "$_port" -j DNAT --to-destination "$_target" &>/dev/null; then
+         _rule_existed=1
+-        iptables -w -t nat -D PREROUTING -p "$_proto" --dport "$_port" -j DNAT --to-destination "$_target" 2>/dev/null && _rule_deleted=1
++        if iptables -w -t nat -D PREROUTING -p "$_proto" --dport "$_port" \
++                -j DNAT --to-destination "$_target" 2>/dev/null; then
++            _rule_deleted=1
++        fi
+     fi
+-    
++
+     iptables -w -D INPUT -p "$_proto" --dport "$_port" -j ACCEPT 2>/dev/null || true
+     iptables -w -D FORWARD -p "$_proto" -d "$_target_ip" --dport "$_target_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+     iptables -w -D FORWARD -p "$_proto" -s "$_target_ip" --sport "$_target_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+-    
+-    # Возвращаем ошибку только если правило существовало но не удалилось
++
+     if [[ $_rule_existed -eq 1 && $_rule_deleted -eq 0 ]]; then
+         return 1
+     fi
+@@ -403,9 +548,9 @@
+ }
+ 
+ check_masquerade_exists() {
++    # FIX #20: MASQUERADE добавляется один раз
+     local _iface="$1"
+-    # Проверяем что есть MASQUERADE для этого интерфейса (с любыми доп. параметрами)
+-    iptables-save -t nat 2>/dev/null | grep -qE "^-A POSTROUTING.*-o ${_iface}.*-j MASQUERADE(\s|$)"
++    iptables-save -t nat 2>/dev/null | grep -qE "^-A POSTROUTING.*-o ${_iface}([[:space:]].*)?-j MASQUERADE([[:space:]]|$)"
+ }
+ 
+ apply_iptables_rules() {
+@@ -414,13 +559,22 @@
+     local _out_port="$3"
+     local _target_ip="$4"
+     local _name="$5"
++    local _allow_prompt="${6:-1}"
+     local _iface
+-    
+-    _iface=$(get_default_interface) || { echo -e "${RED}[ERROR] Нет интерфейса!${NC}"; return 1; }
+-    
++    LAST_OLD_DNAT=""
++    # FIX #13: запоминаем, какие правила существовали ДО операции, чтобы
++    # откат удалял только реально созданное нами, а не чужие правила.
++    local _preexisting_dnat=0
++    local _preexisting_input=0
++    local _preexisting_fwd_in=0
++    local _preexisting_fwd_out=0
++    local _old_dnat_target=""
++
++    _iface=$(get_default_interface) || { echo -e "${RED}[ERROR] Не удалось определить сетевой интерфейс${NC}"; return 1; }
++
+     check_port_available "$_in_port" "$_proto"
+     local _port_status=$?
+-    
++
+     if [[ "$_port_status" -eq 2 ]]; then
+         echo -e "${RED}Ошибка: порт $_in_port вне диапазона 1-65535${NC}"
+         return 1
+@@ -429,281 +583,480 @@
+         echo -e "${YELLOW}DNAT не может быть создан на занятом порту${NC}"
+         return 1
+     fi
+-    
+-    local _target="$_target_ip:$_out_port"
+-    
++
++    local _target="${_target_ip}:${_out_port}"
++
+     if ! validate_target "$_target"; then
+         echo -e "${RED}Ошибка: некорректный target${NC}"
+         return 1
+     fi
+-    
++
++    # Запоминаем текущую цель DNAT на этом порту (для честного отката)
++    _old_dnat_target=$(find_conflicting_dnat "$_proto" "$_in_port" "__none__")
++
+     if check_rule_exists "$_proto" "$_in_port" "$_target"; then
+-        echo -e "${YELLOW}⚠️  Правило существует!${NC}"
+-        read -rp "Перезаписать? (y/n): " _c
+-        [[ "$_c" != "y" ]] && return 1
++        if [[ "$_allow_prompt" -eq 1 ]]; then
++            echo -e "${YELLOW}⚠️  Правило существует!${NC}"
++            read -rp "Перезаписать? (y/n): " _c || return 1
++            [[ "$_c" != "y" ]] && return 0
++        fi
+         delete_rule_by_params "$_proto" "$_in_port" "$_target" || true
+     fi
+-    
+-    backup_rules || true
++
++    # ВАЖНО: && с iptables -C ненадёжен при pipefail/errexit — пишем явные if.
++    if iptables -w -t nat -C PREROUTING -p "$_proto" --dport "$_in_port" -j DNAT --to-destination "$_target" &>/dev/null; then
++        _preexisting_dnat=1
++    fi
++    if iptables -w -C INPUT -p "$_proto" --dport "$_in_port" -j ACCEPT &>/dev/null; then
++        _preexisting_input=1
++    fi
++    if iptables -w -C FORWARD -p "$_proto" -d "$_target_ip" --dport "$_out_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT &>/dev/null; then
++        _preexisting_fwd_in=1
++    fi
++    if iptables -w -C FORWARD -p "$_proto" -s "$_target_ip" --sport "$_out_port" -m state --state ESTABLISHED,RELATED -j ACCEPT &>/dev/null; then
++        _preexisting_fwd_out=1
++    fi
++
+     echo -e "${YELLOW}[*] Применение...${NC}"
+-    log "INFO" "$_proto $_in_port -> $_target_ip:$_out_port"
+-    
+-    iptables -w -A INPUT -p "$_proto" --dport "$_in_port" -j ACCEPT
+-    iptables -w -t nat -A PREROUTING -p "$_proto" --dport "$_in_port" -j DNAT --to-destination "$_target"
+-    
++    log "INFO" "${_proto} ${_in_port} -> ${_target_ip}:${_out_port}"
++
++    if ! iptables -w -t nat -A PREROUTING -p "$_proto" --dport "$_in_port" \
++            -j DNAT --to-destination "$_target"; then
++        echo -e "${RED}❌ Не удалось создать правило DNAT${NC}"
++        return 1
++    fi
++
++    add_rule_once filter INPUT -p "$_proto" --dport "$_in_port" -j ACCEPT || true
++
++    # MASQUERADE сохраняет исходный src клиента при выходе с этого сервера,
++    # чтобы ответный трафик вернулся через NAT. Ветка для 127.* не нужна:
++    # validate_ip() отсекает loopback, а DNAT на собственный внешний IP
++    # работает как hairpin NAT без MASQUERADE.
+     if ! check_masquerade_exists "$_iface"; then
+-        iptables -w -t nat -A POSTROUTING -o "$_iface" -j MASQUERADE
++        add_rule_once nat POSTROUTING -o "$_iface" -j MASQUERADE || true
+     fi
+-    
+-    iptables -w -A FORWARD -p "$_proto" -d "$_target_ip" --dport "$_out_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+-    iptables -w -A FORWARD -p "$_proto" -s "$_target_ip" --sport "$_out_port" -m state --state ESTABLISHED,RELATED -j ACCEPT
+-    
++
++    add_rule_once filter FORWARD -p "$_proto" -d "$_target_ip" --dport "$_out_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT || true
++    add_rule_once filter FORWARD -p "$_proto" -s "$_target_ip" --sport "$_out_port" -m state --state ESTABLISHED,RELATED -j ACCEPT || true
++
+     if command -v ufw &> /dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+         echo -e "${YELLOW}⚠️  UFW активен${NC}"
+-        read -rp "Добавить правило в UFW? (y/n): " _uc
+-        [[ "$_uc" == "y" ]] && ufw allow "$_in_port"/"$_proto" >/dev/null 2>&1 || true
++        read -rp "Добавить правило в UFW? (y/n): " _uc || true
++        # FIX #18: раньше "|| true" позволял выполнить ufw allow при любом ответе
++        if [[ "${_uc:-n}" == "y" ]]; then
++            ufw allow "$_in_port"/"$_proto" >/dev/null 2>&1 || true
++        fi
+     fi
+-    
+-    command -v netfilter-persistent &> /dev/null && netfilter-persistent save >/dev/null 2>&1 || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+-    
++
++    persist_rules || echo -e "${YELLOW}⚠️  Не удалось сохранить правила (проверьте netfilter-persistent)${NC}"
++
+     echo -e "${GREEN}✅ $_name настроен!${NC}"
+     echo -e "${CYAN}📊 $_proto:$_in_port -> $_target_ip:$_out_port${NC}"
+-    log "INFO" "Применено"
+-    
++    log "INFO" "Применено: $_proto $_in_port -> $_target"
++
+     if iptables -w -t nat -C PREROUTING -p "$_proto" --dport "$_in_port" -j DNAT --to-destination "$_target" &>/dev/null; then
+         echo -e "${GREEN}✅ Правило активно в iptables${NC}"
+     fi
+-    
+-    sleep 1
+-    read -rp "Нажмите Enter..."
++
++    # Что мы реально добавили — для корректного отката
++    LAST_ADDED_DNAT=$(( 1 - _preexisting_dnat ))
++    LAST_ADDED_INPUT=$(( 1 - _preexisting_input ))
++    LAST_ADDED_FWD_IN=$(( 1 - _preexisting_fwd_in ))
++    LAST_ADDED_FWD_OUT=$(( 1 - _preexisting_fwd_out ))
++    LAST_OLD_DNAT="$_old_dnat_target"
++
++    return 0
+ }
+ 
+-configure_rule() {
++rollback_applied() {
++    # FIX #13: откат удаляет ТОЛЬКО то, что создала эта операция, и только
++    # для СВОЕГО протокола. Раньше rollback в configure_both_rule сносил
++    # уже существовавшее правило пользователя (проверено: TCP-правило
++    # исчезало, т.к. у TCP и UDP совпадает target).
+     local _proto="$1"
+-    local _name="$2"
+-    local _target_ip=""
+-    local _port=""
+-    
+-    echo -e "\n${CYAN}--- $_name ($_proto) ---${NC}"
+-    
++    local _in_port="$2"
++    local _target="$3"
++
++    if [[ "${LAST_ADDED_DNAT:-0}" -eq 1 ]]; then
++        iptables -w -t nat -D PREROUTING -p "$_proto" --dport "$_in_port" -j DNAT --to-destination "$_target" 2>/dev/null || true
++        # FIX #13b: если мы перезаписывали существующее правило — вернуть его
++        if [[ -n "${LAST_OLD_DNAT:-}" && "${LAST_OLD_DNAT:-}" != "__none__" ]]; then
++            iptables -w -t nat -A PREROUTING -p "$_proto" --dport "$_in_port" \
++                -j DNAT --to-destination "$LAST_OLD_DNAT" 2>/dev/null || true
++        fi
++    fi
++    if [[ "${LAST_ADDED_INPUT:-0}" -eq 1 ]]; then
++        iptables -w -D INPUT -p "$_proto" --dport "$_in_port" -j ACCEPT 2>/dev/null || true
++    fi
++    if [[ "${LAST_ADDED_FWD_IN:-0}" -eq 1 ]]; then
++        iptables -w -D FORWARD -p "$_proto" -d "${_target%:*}" --dport "${_target##*:}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
++    fi
++    if [[ "${LAST_ADDED_FWD_OUT:-0}" -eq 1 ]]; then
++        iptables -w -D FORWARD -p "$_proto" -s "${_target%:*}" --sport "${_target##*:}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
++    fi
++}
++
++ask_ip() {
++    # FIX #4: EOF (Ctrl-D) больше не приводит к бесконечному циклу
++    local _var_name="$1"
++    local _value=""
+     while true; do
+-        read -rp "IP адрес: " _target_ip
+-        [[ -z "$_target_ip" ]] && { echo -e "${RED}Пустой ввод!${NC}"; continue; }
+-        validate_ip "$_target_ip" && break
++        read -rp "IP адрес: " _value || return 1
++        if [[ -z "$_value" ]]; then
++            echo -e "${RED}Пустой ввод!${NC}"
++            continue
++        fi
++        if validate_ip "$_value"; then
++            printf -v "$_var_name" '%s' "$_value"
++            return 0
++        fi
+         echo -e "${RED}Ошибка IP! Используйте формат xxx.xxx.xxx.xxx (не localhost)${NC}"
+     done
+-    
++}
++
++ask_port() {
++    local _var_name="$1"
++    local _prompt="${2:-Порт (1-65535): }"
++    local _value=""
+     while true; do
+-        read -rp "Порт (1-65535): " _port
+-        [[ -z "$_port" ]] && { echo -e "${RED}Пустой ввод!${NC}"; continue; }
+-        validate_port "$_port" && break
++        read -rp "$_prompt" _value || return 1
++        if [[ -z "$_value" ]]; then
++            echo -e "${RED}Пустой ввод!${NC}"
++            continue
++        fi
++        if validate_port "$_value"; then
++            printf -v "$_var_name" '%s' "$_value"
++            return 0
++        fi
+         echo -e "${RED}Ошибка порта! Диапазон 1-65535${NC}"
+     done
+-    
+-    apply_iptables_rules "$_proto" "$_port" "$_port" "$_target_ip" "$_name"
++}
++
++preflight_check() {
++    # Проверки до создания бэкапа: не плодим "пустые" бэкапы на заведомо
++    # отклонённых операциях (в v1.0 бэкап создавался до проверки порта).
++    local _proto="$1"
++    local _in_port="$2"
++    local _out_port="$3"
++    local _target_ip="$4"
++
++    if ! validate_target "${_target_ip}:${_out_port}"; then
++        echo -e "${RED}Ошибка: некорректный адрес назначения${NC}"
++        return 1
++    fi
++
++    check_port_available "$_in_port" "$_proto"
++    local _port_status=$?
++
++    if [[ "$_port_status" -eq 2 ]]; then
++        echo -e "${RED}Ошибка: порт $_in_port вне диапазона 1-65535${NC}"
++        return 1
++    elif [[ "$_port_status" -eq 1 ]]; then
++        echo -e "${RED}❌ Порт $_in_port занят другим сервисом!${NC}"
++        echo -e "${YELLOW}DNAT не может быть создан на занятом порту${NC}"
++        return 1
++    fi
++
++    local _conflict
++    _conflict=$(find_conflicting_dnat "$_proto" "$_in_port" "${_target_ip}:${_out_port}")
++    if [[ -n "$_conflict" ]]; then
++        echo -e "${RED}❌ На порту $_in_port уже есть DNAT на $_conflict${NC}"
++        echo -e "${YELLOW}   Удалите старое правило (пункт 7) или укажите другой входящий порт${NC}"
++        return 1
++    fi
++
++    return 0
++}
++
++confirm_and_apply() {
++    # FIX #9: один бэкап и один Enter на операцию, вместо дублирующегося кода
++    local _proto="$1"
++    local _in_port="$2"
++    local _out_port="$3"
++    local _target_ip="$4"
++    local _name="$5"
++
++    if ! preflight_check "$_proto" "$_in_port" "$_out_port" "$_target_ip"; then
++        read -rp "Enter..." _ || true
++        return 1
++    fi
++
++    if ! backup_rules; then
++        read -rp "Продолжить без бэкапа? (y/n): " _bc || return 1
++        [[ "${_bc:-n}" == "y" ]] || return 1
++    fi
++
++    if ! apply_iptables_rules "$_proto" "$_in_port" "$_out_port" "$_target_ip" "$_name"; then
++        read -rp "Enter..." _ || true
++        return 1
++    fi
++
++    sleep 1
++    read -rp "Нажмите Enter..." _ || true
++    return 0
++}
++
++configure_rule() {
++    local _proto="$1"
++    local _name="$2"
++    local _target_ip=""
++    local _port=""
++
++    echo -e "\n${CYAN}--- $_name ($_proto) ---${NC}"
++
++    ask_ip _target_ip || return 1
++    ask_port _port || return 1
++
++    confirm_and_apply "$_proto" "$_port" "$_port" "$_target_ip" "$_name"
+ }
+ 
+ configure_both_rule() {
+     local _target_ip=""
+     local _port=""
+-    
++
+     echo -e "\n${CYAN}--- WireGuard Full (UDP+TCP fallback) ---${NC}"
+-    
+-    while true; do
+-        read -rp "IP: " _target_ip
+-        [[ -z "$_target_ip" ]] && { echo -e "${RED}Пустой ввод!${NC}"; continue; }
+-        validate_ip "$_target_ip" && break
+-        echo -e "${RED}Ошибка IP!${NC}"
+-    done
+-    
+-    while true; do
+-        read -rp "Порт (1-65535): " _port
+-        [[ -z "$_port" ]] && { echo -e "${RED}Пустой ввод!${NC}"; continue; }
+-        validate_port "$_port" && break
+-        echo -e "${RED}Ошибка порта!${NC}"
+-    done
+-    
+-    # Проверка портов перед применением
+-    check_port_available "$_port" "tcp"
+-    local _tcp_status=$?
+-    check_port_available "$_port" "udp"
+-    local _udp_status=$?
+-    
+-    if [[ "$_tcp_status" -eq 2 ]] || [[ "$_udp_status" -eq 2 ]]; then
+-        echo -e "${RED}❌ Порт $_port вне диапазона${NC}"
+-        return 1
+-    fi
+-    
+-    if [[ "$_tcp_status" -eq 1 ]] || [[ "$_udp_status" -eq 1 ]]; then
+-        echo -e "${RED}❌ Порт $_port занят одним из протоколов (TCP/UDP)!${NC}"
+-        return 1
+-    fi
+-    
+-    # Проверка существования правил
+-    local _target="$_target_ip:$_port"
++
++    ask_ip _target_ip || return 1
++    ask_port _port || return 1
++
++    # FIX #12/#13: применяем ОБА протокола одной транзакцией:
++    #  1) заранее проверяем конфликты и занятость портов для tcp и udp;
++    #  2) откат в случае частичного успеха удаляет только созданное нами
++    #     и только для своего протокола (без вызовов apply_iptables_rules,
++    #     который перезаписывает глобальные флаги отката).
++    if ! preflight_check "tcp" "$_port" "$_port" "$_target_ip" \
++       || ! preflight_check "udp" "$_port" "$_port" "$_target_ip"; then
++        read -rp "Enter..." _ || true
++        return 1
++    fi
++
++    local _target="${_target_ip}:${_port}"
++    local _need_confirm=0
+     if check_rule_exists "tcp" "$_port" "$_target" || check_rule_exists "udp" "$_port" "$_target"; then
++        _need_confirm=1
+         echo -e "${YELLOW}⚠️  Одно из правил уже существует${NC}"
+-        read -rp "Перезаписать оба? (y/n): " _c
+-        [[ "$_c" != "y" ]] && return 1
++        read -rp "Перезаписать оба? (y/n): " _c || return 1
++        [[ "${_c:-n}" != "y" ]] && return 0
+     fi
+-    
+-    backup_rules || true
+-    
+-    # Применяем оба с отслеживанием
+-    local _tcp_applied=0 _udp_applied=0
+-    
+-    if apply_iptables_rules "tcp" "$_port" "$_port" "$_target_ip" "TCP" 2>/dev/null; then
+-        _tcp_applied=1
+-    fi
+-    
+-    if apply_iptables_rules "udp" "$_port" "$_port" "$_target_ip" "UDP" 2>/dev/null; then
+-        _udp_applied=1
+-    fi
+-    
+-    # Rollback при частичном применении
+-    if [[ $_tcp_applied -eq 1 && $_udp_applied -eq 0 ]]; then
+-        echo -e "${YELLOW}⚠️  UDP не удалось, откатываем TCP...${NC}"
+-        delete_rule_by_params "tcp" "$_port" "$_target" || true
+-        echo -e "${RED}❌ Операция отменена (rollback выполнен)${NC}"
+-        return 1
+-    elif [[ $_tcp_applied -eq 0 && $_udp_applied -eq 1 ]]; then
+-        echo -e "${YELLOW}⚠️  TCP не удалось, откатываем UDP...${NC}"
+-        delete_rule_by_params "udp" "$_port" "$_target" || true
+-        echo -e "${RED}❌ Операция отменена (rollback выполнен)${NC}"
++
++    if ! backup_rules; then
++        read -rp "Продолжить без бэкапа? (y/n): " _bc || return 1
++        [[ "${_bc:-n}" == "y" ]] || return 1
++    fi
++
++    # --- применяем tcp ---
++    local _tcp_ok=0 _udp_ok=0
++    local _tcp_new_dnat=0 _tcp_new_input=0 _tcp_new_fwd1=0 _tcp_new_fwd2=0
++    local _udp_new_dnat=0 _udp_new_input=0 _udp_new_fwd1=0 _udp_new_fwd2=0
++    local _tcp_old="" _udp_old=""
++    local _tcp_err="" _udp_err=""
++
++    _tcp_old=$(find_conflicting_dnat "tcp" "$_port" "__none__")
++    if apply_iptables_rules "tcp" "$_port" "$_port" "$_target_ip" "TCP" 0 > /tmp/.ipforward-both.$$ 2>&1; then
++        _tcp_ok=1
++        _tcp_new_dnat=$LAST_ADDED_DNAT
++        _tcp_new_input=$LAST_ADDED_INPUT
++        _tcp_new_fwd1=$LAST_ADDED_FWD_IN
++        _tcp_new_fwd2=$LAST_ADDED_FWD_OUT
++    else
++        _tcp_err=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/.ipforward-both.$$ 2>/dev/null | tail -3)
++        rm -f /tmp/.ipforward-both.$$ 2>/dev/null || true
++        echo -e "${RED}❌ TCP не применён:${NC}"
++        [[ -n "$_tcp_err" ]] && echo -e "$_tcp_err"
++        read -rp "Enter..." _ || true
+         return 1
+-    elif [[ $_tcp_applied -eq 0 && $_udp_applied -eq 0 ]]; then
+-        echo -e "${RED}❌ Оба протокола не удалось применить${NC}"
++    fi
++    rm -f /tmp/.ipforward-both.$$ 2>/dev/null || true
++
++    _udp_old=$(find_conflicting_dnat "udp" "$_port" "__none__")
++    if apply_iptables_rules "udp" "$_port" "$_port" "$_target_ip" "UDP" 0 > /tmp/.ipforward-both.$$ 2>&1; then
++        _udp_ok=1
++        _udp_new_dnat=$LAST_ADDED_DNAT
++        _udp_new_input=$LAST_ADDED_INPUT
++        _udp_new_fwd1=$LAST_ADDED_FWD_IN
++        _udp_new_fwd2=$LAST_ADDED_FWD_OUT
++    else
++        _udp_err=$(sed 's/\x1b\[[0-9;]*m//g' /tmp/.ipforward-both.$$ 2>/dev/null | tail -3)
++    fi
++    rm -f /tmp/.ipforward-both.$$ 2>/dev/null || true
++
++    if [[ $_udp_ok -eq 0 && $_tcp_ok -eq 1 ]]; then
++        echo -e "${YELLOW}⚠️  UDP не удалось применить, откатываем только TCP-часть...${NC}"
++        [[ -n "$_udp_err" ]] && echo -e "$_udp_err"
++        if [[ "$_tcp_new_dnat" -eq 1 ]]; then
++            iptables -w -t nat -D PREROUTING -p tcp --dport "$_port" -j DNAT --to-destination "$_target" 2>/dev/null || true
++            if [[ -n "$_tcp_old" && "$_tcp_old" != "__none__" ]]; then
++                iptables -w -t nat -A PREROUTING -p tcp --dport "$_port" -j DNAT --to-destination "$_tcp_old" 2>/dev/null || true
++            fi
++        fi
++        if [[ "$_tcp_new_input" -eq 1 ]]; then
++            iptables -w -D INPUT -p tcp --dport "$_port" -j ACCEPT 2>/dev/null || true
++        fi
++        if [[ "$_tcp_new_fwd1" -eq 1 ]]; then
++            iptables -w -D FORWARD -p tcp -d "$_target_ip" --dport "$_port" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
++        fi
++        if [[ "$_tcp_new_fwd2" -eq 1 ]]; then
++            iptables -w -D FORWARD -p tcp -s "$_target_ip" --sport "$_port" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
++        fi
++        persist_rules || true
++        echo -e "${RED}❌ Операция отменена (TCP-изменения откатаны)${NC}"
++        read -rp "Enter..." _ || true
+         return 1
+     fi
+-    
++
++    persist_rules || true
+     echo -e "${GREEN}✅ Оба правила (TCP+UDP) применены успешно${NC}"
++    echo -e "${CYAN}📊 tcp/udp:$_port -> $_target_ip:$_port${NC}"
++    log "INFO" "Применено: tcp+udp $_port -> $_target_ip:$_port"
++    sleep 1
++    read -rp "Нажмите Enter..." _ || true
++    return 0
+ }
+ 
+ configure_custom_rule() {
++    # FIX #17: единственный вопрос «Перезаписать?»
+     local _proto=""
+     local _target_ip=""
+     local _in_port=""
+     local _out_port=""
+-    
++
+     echo -e "\n${CYAN}--- Кастомное правило ---${NC}"
+-    
++
+     while true; do
+-        read -rp "Протокол (tcp/udp): " _proto
+-        [[ -z "$_proto" ]] && { echo -e "${RED}Пустой ввод!${NC}"; continue; }
++        read -rp "Протокол (tcp/udp): " _proto || return 1
++        if [[ -z "$_proto" ]]; then
++            echo -e "${RED}Пустой ввод!${NC}"
++            continue
++        fi
+         [[ "$_proto" == "tcp" || "$_proto" == "udp" ]] && break
+         echo -e "${RED}Ошибка! Введите tcp или udp${NC}"
+     done
+-    
+-    while true; do
+-        read -rp "IP: " _target_ip
+-        [[ -z "$_target_ip" ]] && { echo -e "${RED}Пустой ввод!${NC}"; continue; }
+-        validate_ip "$_target_ip" && break
+-        echo -e "${RED}Ошибка IP!${NC}"
+-    done
+-    
+-    while true; do
+-        read -rp "Входящий порт: " _in_port
+-        [[ -z "$_in_port" ]] && { echo -e "${RED}Пустой ввод!${NC}"; continue; }
+-        validate_port "$_in_port" && break
+-        echo -e "${RED}Ошибка! Диапазон 1-65535${NC}"
+-    done
+-    
+-    while true; do
+-        read -rp "Исходящий порт: " _out_port
+-        [[ -z "$_out_port" ]] && { echo -e "${RED}Пустой ввод!${NC}"; continue; }
+-        validate_port "$_out_port" && break
+-        echo -e "${RED}Ошибка! Диапазон 1-65535${NC}"
+-    done
+-    
+-    # Проверка на существование правила
++
++    ask_ip _target_ip || return 1
++    ask_port _in_port "Входящий порт: " || return 1
++    ask_port _out_port "Исходящий порт: " || return 1
++
+     local _target="$_target_ip:$_out_port"
+     if check_rule_exists "$_proto" "$_in_port" "$_target"; then
+         echo -e "${YELLOW}⚠️  Правило уже существует!${NC}"
+-        read -rp "Перезаписать? (y/n): " _c
+-        [[ "$_c" != "y" ]] && return 1
++        read -rp "Перезаписать? (y/n): " _c || return 1
++        [[ "${_c:-n}" != "y" ]] && return 1
+     fi
+-    
+-    apply_iptables_rules "$_proto" "$_in_port" "$_out_port" "$_target_ip" "Custom"
++
++    confirm_and_apply "$_proto" "$_in_port" "$_out_port" "$_target_ip" "Custom"
+ }
+ 
+ list_active_rules() {
+     local -a _rules_list=()
+     local -a _raw_list=()
+-    
++
+     parse_nat_rules _rules_list _raw_list || true
+-    
++
+     echo -e "\n${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+     echo -e "${CYAN}              АКТИВНЫЕ ПРАВИЛА                                  ${NC}"
+     echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+-    
+-    [[ ${#_rules_list[@]} -eq 0 ]] && { echo -e "${YELLOW}Нет правил${NC}"; read -rp "Enter..."; return; }
+-    
+-    printf "${WHITE}%-5s | %-8s | %-10s | %-21s${NC}\n" "№" "Протокол" "Порт" "Назначение"
++
++    if [[ ${#_rules_list[@]} -eq 0 ]]; then
++        echo -e "${YELLOW}Нет правил${NC}"
++        read -rp "Enter..." _ || true
++        return 0
++    fi
++
++    echo -e "${WHITE}N    | Протокол | Порт        | Назначение${NC}"
+     echo -e "${CYAN}---------------------------------------------------------------${NC}"
+-    
++
+     local _i=1
++    local _rule _r_proto _r_port _r_dest
+     for _rule in "${_rules_list[@]}"; do
+-        IFS=':' read -r _r_proto _r_port _r_dest <<< "$_rule"
+-        printf "${GREEN}%-5s${NC} | %-8s | %-10s | %-21s\n" "$_i" "$_r_proto" "$_r_port" "$_r_dest"
+-        ((_i++)) || true
++        IFS='|' read -r _r_proto _r_port _r_dest <<< "$_rule"
++        printf "%-4s | %-8s | %-11s | %s\n" "$_i" "$_r_proto" "$_r_port" "$_r_dest"
++        (( _i++ )) || true
+     done
+-    
+-    read -rp "Enter..."
++
++    read -rp "Enter..." _ || true
+ }
+ 
+ delete_single_rule() {
+     local -a _rules_list=()
+     local -a _raw_list=()
+-    
++
+     parse_nat_rules _rules_list _raw_list || true
+-    
++
+     echo -e "\n${CYAN}--- Удаление ---${NC}"
+-    [[ ${#_rules_list[@]} -eq 0 ]] && { echo -e "${RED}Нет правил${NC}"; read -rp "Enter..."; return; }
+-    
++    if [[ ${#_rules_list[@]} -eq 0 ]]; then
++        echo -e "${RED}Нет правил${NC}"; read -rp "Enter..." _ || true; return 0
++    fi
++
+     local _i=1
++    local _rule _r_proto _r_port _r_dest
+     for _rule in "${_rules_list[@]}"; do
+-        IFS=':' read -r _r_proto _r_port _r_dest <<< "$_rule"
++        IFS='|' read -r _r_proto _r_port _r_dest <<< "$_rule"
+         echo -e "${YELLOW}[$_i]${NC} $_r_proto:$_r_port -> $_r_dest"
+-        ((_i++)) || true
++        (( _i++ )) || true
+     done
+-    
+-    read -rp "Номер (0 отмена): " _num
+-    [[ "$_num" == "0" ]] && return
+-    [[ ! "$_num" =~ ^[0-9]+$ ]] || [[ -z "${_rules_list[$_num]:-}" ]] && { echo -e "${RED}Ошибка!${NC}"; read -rp "Enter..."; return; }
+-    
+-    backup_rules || true
+-    IFS=':' read -r _d_proto _d_port _d_dest <<< "${_rules_list[$_num]}"
++
++    read -rp "Номер (0 отмена): " _num || return 1
++    [[ "$_num" == "0" ]] && return 0
++
++    if [[ ! "$_num" =~ ^[0-9]+$ ]] || [[ -z "${_rules_list[$_num]:-}" ]]; then
++        echo -e "${RED}Ошибка!${NC}"; read -rp "Enter..." _ || true; return 0
++    fi
++
++    if ! backup_rules; then
++        read -rp "Продолжить без бэкапа? (y/n): " _bc || return 1
++        [[ "${_bc:-n}" == "y" ]] || return 1
++    fi
++
++    IFS='|' read -r _d_proto _d_port _d_dest <<< "${_rules_list[$_num]}"
+     echo -e "${YELLOW}Удаляю: $_d_proto:$_d_port -> $_d_dest${NC}"
+-    
+-    delete_rule_by_params "$_d_proto" "$_d_port" "$_d_dest" && {
+-        command -v netfilter-persistent &> /dev/null && netfilter-persistent save >/dev/null 2>&1 || true
++
++    if delete_rule_by_params "$_d_proto" "$_d_port" "$_d_dest" && persist_rules; then
+         echo -e "${GREEN}✅ Удалено${NC}"
+-        log "INFO" "Удалено: $_d_proto:$_d_port"
+-    } || echo -e "${RED}⚠️  Проблемы при удалении${NC}"
+-    
+-    read -rp "Enter..."
++        log "INFO" "Удалено: $_d_proto:$_d_port -> $_d_dest"
++    else
++        echo -e "${RED}⚠️  Проблемы при удалении${NC}"
++    fi
++
++    read -rp "Enter..." _ || true
+ }
+ 
+ flush_rules() {
+     echo -e "\n${RED}═══════════════════════════════════════════════════════════════${NC}"
+     echo -e "${RED}!!! ВНИМАНИЕ !!! УДАЛЕНИЕ ВСЕХ ПРАВИЛ !!!${NC}"
+     echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
+-    
+-    list_active_rules
++
++    # FIX #8: свой вывод списка, без вложенного read из list_active_rules
++    local -a _rules_list=()
++    local -a _raw_list=()
++    parse_nat_rules _rules_list _raw_list || true
++    if [[ ${#_rules_list[@]} -gt 0 ]]; then
++        local _i=1 _rule _r_proto _r_port _r_dest
++        for _rule in "${_rules_list[@]}"; do
++            IFS='|' read -r _r_proto _r_port _r_dest <<< "$_rule"
++            echo -e "  ${YELLOW}[$_i]${NC} $_r_proto:$_r_port -> $_r_dest"
++            (( _i++ )) || true
++        done
++    fi
++
+     echo -e "${YELLOW}Рекомендуется бэкап перед очисткой.${NC}"
+-    read -rp "Сделать бэкап? (y/n): " _bc
+-    [[ "$_bc" == "y" ]] && backup_rules || true
+-    
++    read -rp "Сделать бэкап? (y/n): " _bc || return 1
++    # FIX #8: бэкап только при подтверждении (раньше создавался всегда из-за || true)
++    if [[ "${_bc:-n}" == "y" ]]; then
++        backup_rules || true
++    fi
++
+     echo -e "${RED}⚠️  ВНИМАНИЕ: Это удалит ВСЕ правила INPUT/FORWARD/NAT!${NC}"
+     echo -e "${RED}   Включая SSH и другие защитные правила!${NC}"
+     echo -e "${YELLOW}   Убедитесь, что у вас есть альтернативный доступ (KVM/IPMI)${NC}"
+-    read -rp "Для продолжения введите 'DELETE ALL': " _c
+-    
+-    [[ "$_c" != "DELETE ALL" ]] && { echo -e "${GREEN}Отменено${NC}"; read -rp "Enter..."; return; }
+-    
++    read -rp "Для продолжения введите 'DELETE ALL': " _c || return 1
++
++    if [[ "$_c" != "DELETE ALL" ]]; then
++        echo -e "${GREEN}Отменено${NC}"; read -rp "Enter..." _ || true; return 0
++    fi
++
+     echo -e "${YELLOW}Очистка...${NC}"
+     log "WARN" "Очистка всех правил"
+-    
++
+     iptables -w -t nat -F 2>/dev/null || true
+     iptables -w -t mangle -F 2>/dev/null || true
+     iptables -w -F FORWARD 2>/dev/null || true
+@@ -711,79 +1064,111 @@
+     iptables -w -P FORWARD DROP 2>/dev/null || true
+     iptables -w -P INPUT ACCEPT 2>/dev/null || true
+     iptables -w -P OUTPUT ACCEPT 2>/dev/null || true
+-    
+-    command -v netfilter-persistent &> /dev/null && netfilter-persistent save >/dev/null 2>&1 || true
++
++    persist_rules || true
+     echo -e "${GREEN}✅ Очищено (FORWARD=DROP, INPUT=ACCEPT)${NC}"
+     log "INFO" "Очищено"
+-    
+-    read -rp "Enter..."
++
++    read -rp "Enter..." _ || true
+ }
+ 
+ show_statistics() {
+     local -a _rules_list=()
+     local -a _raw_list=()
+-    
++
+     parse_nat_rules _rules_list _raw_list || true
+-    
++
+     echo -e "\n${CYAN}--- Статистика ---${NC}"
+-    [[ ${#_rules_list[@]} -eq 0 ]] && { echo -e "${YELLOW}Нет правил${NC}"; read -rp "Enter..."; return; }
+-    
++    if [[ ${#_rules_list[@]} -eq 0 ]]; then
++        echo -e "${YELLOW}Нет правил${NC}"; read -rp "Enter..." _ || true; return 0
++    fi
++
+     local _i=1
++    local _rule _r_proto _r_port _r_dest
+     for _rule in "${_rules_list[@]}"; do
+-        IFS=':' read -r _r_proto _r_port _r_dest <<< "$_rule"
+-        echo -e "${YELLOW}#$_i ($_r_proto:$_r_port -> ${_r_dest%:*})${NC}"
+-        iptables -w -L FORWARD -v -n 2>/dev/null | grep -E "dpt:${_r_port}\b|spt:$(echo "${_r_dest#*:}" | cut -d: -f1)\b" | head -2 || echo "  Нет данных"
+-        ((_i++)) || true
++        IFS='|' read -r _r_proto _r_port _r_dest <<< "$_rule"
++        echo -e "${YELLOW}#$_i ($_r_proto:$_r_port -> $_r_dest)${NC}"
++        # FIX #14: без -x iptables печатает "12K"/"3M" — awk не мог сложить;
++        #      раньше также смешивались dport входящего и spt исходящего.
++        local _in_pkts _out_pkts
++        _in_pkts=$(iptables -w -L FORWARD -v -n -x 2>/dev/null | awk -v p="dpt:$_r_port" 'index($0, p) && index($0, "ACCEPT") {sum+=$1} END {print sum+0}')
++        _out_pkts=$(iptables -w -L FORWARD -v -n -x 2>/dev/null | awk -v p="spt:${_r_dest##*:}" 'index($0, p) && index($0, "ACCEPT") {sum+=$1} END {print sum+0}')
++        echo "  пакетов к назначению: ${_in_pkts}, обратно: ${_out_pkts}"
++        if [[ "${_in_pkts:-0}" -eq 0 ]]; then
++            echo -e "  ${YELLOW}⚠️  трафик через правило ещё не шёл — проверьте пункт 11${NC}"
++        fi
++        (( _i++ )) || true
+     done
+-    
+-    read -rp "Enter..."
++
++    read -rp "Enter..." _ || true
+ }
+ 
+ test_connection() {
+     local -a _rules_list=()
+     local -a _raw_list=()
+-    
++
+     parse_nat_rules _rules_list _raw_list || true
+-    
++
+     echo -e "\n${CYAN}--- Проверка ---${NC}"
+-    [[ ${#_rules_list[@]} -eq 0 ]] && { echo -e "${YELLOW}Нет правил${NC}"; read -rp "Enter..."; return; }
+-    
++    if [[ ${#_rules_list[@]} -eq 0 ]]; then
++        echo -e "${YELLOW}Нет правил${NC}"; read -rp "Enter..." _ || true; return 0
++    fi
++
+     local _i=1
++    local _rule _r_proto _r_port _r_dest
+     for _rule in "${_rules_list[@]}"; do
+-        IFS=':' read -r _r_proto _r_port _r_dest <<< "$_rule"
++        IFS='|' read -r _r_proto _r_port _r_dest <<< "$_rule"
+         echo -e "${YELLOW}[$_i]${NC} $_r_proto:$_r_port -> $_r_dest"
+-        ((_i++)) || true
++        (( _i++ )) || true
+     done
+-    
+-    read -rp "Номер (0 отмена): " _num
+-    [[ "$_num" == "0" ]] && return
+-    [[ ! "$_num" =~ ^[0-9]+$ ]] || [[ -z "${_rules_list[$_num]:-}" ]] && { echo -e "${RED}Ошибка!${NC}"; read -rp "Enter..."; return; }
+-    
+-    IFS=':' read -r _test_proto _test_port _test_dest <<< "${_rules_list[$_num]}"
++
++    read -rp "Номер (0 отмена): " _num || return 1
++    [[ "$_num" == "0" ]] && return 0
++
++    if [[ ! "$_num" =~ ^[0-9]+$ ]] || [[ -z "${_rules_list[$_num]:-}" ]]; then
++        echo -e "${RED}Ошибка!${NC}"; read -rp "Enter..." _ || true; return 0
++    fi
++
++    IFS='|' read -r _test_proto _test_port _test_dest <<< "${_rules_list[$_num]}"
+     local _test_ip="${_test_dest%:*}"
+-    local _test_dport="${_test_dest#*:}"
+-    
++    local _test_dport="${_test_dest##*:}"
++
++    # FIX #15: для диапазона портов точечная проверка невозможна
++    if [[ "$_test_dport" == *":"* ]] || [[ "$_test_port" == *":"* ]]; then
++        echo -e "${YELLOW}⚠️  Диапазон портов — точечная проверка невозможна${NC}"
++        read -rp "Enter..." _ || true
++        return 0
++    fi
++
+     echo -e "${YELLOW}Проверка $_test_ip:$_test_dport ($_test_proto)...${NC}"
+     local _nc_result=1
+-    
++
+     if [[ "$_test_proto" == "tcp" ]]; then
+-        timeout 5 nc -zv -w3 "$_test_ip" "$_test_dport" 2>&1 && _nc_result=0 || true
++        if timeout 5 nc -zv -w3 "$_test_ip" "$_test_dport" 2>&1; then
++            _nc_result=0
++        fi
+     else
+         echo -e "${YELLOW}⚠️  UDP тест ненадёжен (connectionless протокол)${NC}"
+         echo -e "${YELLOW}   'Успех' = пакет отправлен, но не факт что сервис ответил${NC}"
+-        timeout 5 nc -zuv -w3 "$_test_ip" "$_test_dport" 2>&1 && _nc_result=0 || true
++        if timeout 5 nc -zuv -w3 "$_test_ip" "$_test_dport" 2>&1; then
++            _nc_result=0
++        fi
++    fi
++
++    if [[ $_nc_result -eq 0 ]]; then
++        echo -e "${GREEN}✅ Успех${NC}"
++    else
++        echo -e "${RED}❌ Не удалось${NC}"
+     fi
+-    
+-    [[ $_nc_result -eq 0 ]] && echo -e "${GREEN}✅ Успех${NC}" || echo -e "${RED}❌ Не удалось${NC}"
+-    read -rp "Enter..."
++    read -rp "Enter..." _ || true
+ }
+ 
+ show_menu() {
+     local _choice
+     while true; do
+-        clear
++        clear 2>/dev/null || true
+         echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+-        echo -e "${CYAN}║         IPTABLES FORWARDING MANAGER v1.0 (Final)              ║${NC}"
++        echo -e "${CYAN}║         IPTABLES FORWARDING MANAGER v${SCRIPT_VERSION}               ║${NC}"
+         echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
+         echo -e "\n1) ${GREEN}AmneziaWG/WireGuard${NC} (UDP)"
+         echo -e "2) ${GREEN}VLESS/XRay${NC} (TCP)"
+@@ -798,39 +1183,260 @@
+         echo -e "11) ${BLUE}🔌 Проверка соединения${NC}"
+         echo -e "0) ${WHITE}Выход${NC}"
+         echo -e "------------------------------------------------------"
+-        read -rp "Выбор: " _choice
++        # FIX #4: EOF (Ctrl-D) — корректный выход, а не бесконечный цикл меню
++        if ! read -rp "Выбор: " _choice; then
++            echo -e "\n${GREEN}Пока!${NC}"
++            log "INFO" "Завершён (EOF)"
++            exit 0
++        fi
+         case $_choice in
+-            1) configure_rule "udp" "AmneziaWG" ;;
+-            2) configure_rule "tcp" "VLESS" ;;
+-            3) configure_rule "tcp" "MTProto" ;;
+-            4) configure_both_rule ;;
+-            5) configure_custom_rule ;;
++            1) configure_rule "udp" "AmneziaWG" || true ;;
++            2) configure_rule "tcp" "VLESS" || true ;;
++            3) configure_rule "tcp" "MTProto" || true ;;
++            4) configure_both_rule || true ;;
++            5) configure_custom_rule || true ;;
+             6) list_active_rules ;;
+-            7) delete_single_rule ;;
+-            8) flush_rules ;;
++            7) delete_single_rule || true ;;
++            8) flush_rules || true ;;
+             9) show_instructions ;;
+             10) show_statistics ;;
+-            11) test_connection ;;
++            11) test_connection || true ;;
+             0) echo -e "${GREEN}Пока!${NC}"; log "INFO" "Завершён"; exit 0 ;;
+             *) echo -e "${RED}Ошибка! Неверный пункт меню${NC}"; sleep 1 ;;
+         esac
++        # FIX #3: set -e больше нет; ошибка пункта меню возвращает в меню,
++        # а не завершает сессию (раньше при отказе операции скрипт закрывался).
++    done
++}
++
++usage() {
++    cat <<USAGE_EOF
++IPTABLES FORWARDING MANAGER v${SCRIPT_VERSION}
++
++Использование:
++  sudo ipforward                 интерактивное меню (по умолчанию)
++  sudo ipforward list [--raw]    показать активные DNAT-правила
++  sudo ipforward diag            диагностика окружения (без изменений)
++  ipforward --help               эта справка
++  ipforward --version            версия
++
++Требования: Linux, Bash 4.3+, root (для пунктов, изменяющих систему).
++
++Документация: ${REPO_URL}
++USAGE_EOF
++}
++
++print_version() {
++    echo "ipforward ${SCRIPT_VERSION}"
++}
++
++# --- CLI: list -----------------------------------------------------------
++cli_list() {
++    local _raw=0
++    [[ "${1:-}" == "--raw" ]] && _raw=1
++
++    local -a _rules_list=()
++    local -a _raw_list=()
++    parse_nat_rules _rules_list _raw_list || true
++
++    if [[ ${#_rules_list[@]} -eq 0 ]]; then
++        echo "Нет DNAT-правил"
++        return 0
++    fi
++
++    if [[ $_raw -eq 1 ]]; then
++        local _k
++        for _k in "${!_raw_list[@]}"; do
++            echo "${_raw_list[$_k]}"
++        done
++        return 0
++    fi
++
++    printf "%-4s | %-8s | %-11s | %s\n" "N" "Протокол" "Порт" "Назначение"
++    echo "---------------------------------------------------------------"
++    local _i=1 _rule _p _port _dest
++    for _rule in "${_rules_list[@]}"; do
++        IFS='|' read -r _p _port _dest <<< "$_rule"
++        printf "%-4s | %-8s | %-11s | %s\n" "$_i" "$_p" "$_port" "$_dest"
++        (( _i++ )) || true
+     done
++    return 0
++}
++
++# --- CLI: diag -----------------------------------------------------------
++cli_diag() {
++    local _rc=0
++    _diag_line() {
++        local _status="$1" _name="$2" _value="$3" _pad
++        # FIX #23: printf "%-28s" считает БАЙТЫ в C-locale, поэтому на кириллице
++        # колонки разъезжались. Добиваем пробелы вручную — ${#_name} и padding
++        # измеряются одинаково в любом locale.
++        _pad=$((28 - ${#_name}))
++        (( _pad < 1 )) && _pad=1
++        printf "[%-6s] %s%*s%s\n" "$_status" "$_name" "$_pad" "" "$_value"
++    }
++
++    echo "ipforward ${SCRIPT_VERSION} — диагностика"
++    echo "---------------------------------------------------------------"
++
++    # ОС
++    if [[ -r /etc/os-release ]]; then
++        # shellcheck source=/dev/null
++        _diag_line "OK" "Дистрибутив" "$( . /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-$NAME}" )"
++    else
++        _diag_line "WARN" "Дистрибутив" "не определён"
++    fi
++
++    # ядро
++    _diag_line "INFO" "Ядро" "$(uname -r)"
++    # bash
++    if [[ "${BASH_VERSINFO[0]}" -gt 4 ]] || [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 3 ]]; then
++        _diag_line "OK" "Bash >= 4.3" "$BASH_VERSION"
++    else
++        _diag_line "FAIL" "Bash >= 4.3" "$BASH_VERSION"
++        _rc=1
++    fi
++
++    # root
++    if [[ "$EUID" -eq 0 ]]; then
++        _diag_line "OK" "Root" "да"
++    else
++        _diag_line "WARN" "Root" "нет (менять правила нельзя)"
++    fi
++
++    # зависимости
++    local _cmd
++    for _cmd in iptables iptables-save ip ss nc timeout; do
++        if command -v "$_cmd" &>/dev/null; then
++            _diag_line "OK" "Зависимость: $_cmd" "$(command -v "$_cmd")"
++        else
++            _diag_line "FAIL" "Зависимость: $_cmd" "не найдена"
++            _rc=1
++        fi
++    done
++
++    # ip_forward
++    local _fwd
++    _fwd=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "?")
++    if [[ "$_fwd" == "1" ]]; then
++        _diag_line "OK" "net.ipv4.ip_forward" "1"
++    else
++        _diag_line "WARN" "net.ipv4.ip_forward" "${_fwd} (скрипт включит при старте)"
++    fi
++
++    # bbr
++    local _cc
++    _cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
++    _diag_line "INFO" "TCP congestion control" "$_cc"
++
++    # интерфейс
++    local _iface
++    if _iface=$(get_default_interface 2>/dev/null); then
++        _diag_line "OK" "Интерфейс по умолчанию" "$_iface"
++    else
++        _diag_line "FAIL" "Интерфейс по умолчанию" "не определён"
++        _rc=1
++    fi
++
++    # контейнер
++    if is_container; then
++        _diag_line "INFO" "Контейнер" "да (BBR пропускается)"
++    else
++        _diag_line "INFO" "Контейнер" "нет"
++    fi
++
++    # persistence
++    if command -v netfilter-persistent &>/dev/null; then
++        _diag_line "OK" "netfilter-persistent" "есть"
++    else
++        _diag_line "WARN" "netfilter-persistent" "нет (fallback: iptables-save)"
++    fi
++    if [[ -f /etc/iptables/rules.v4 ]]; then
++        _diag_line "OK" "/etc/iptables/rules.v4" "$(stat -c '%y' /etc/iptables/rules.v4 2>/dev/null | cut -d. -f1)"
++    else
++        _diag_line "INFO" "/etc/iptables/rules.v4" "нет (создастся при сохранении)"
++    fi
++
++    # ufw
++    if command -v ufw &>/dev/null; then
++        local _ufw
++        _ufw=$(ufw status 2>/dev/null | head -1)
++        _diag_line "INFO" "UFW" "${_ufw:-неизвестно}"
++    else
++        _diag_line "INFO" "UFW" "не установлен"
++    fi
++
++    # правила
++    local -a _rules=()
++    local -a _raw=()
++    parse_nat_rules _rules _raw || true
++    _diag_line "INFO" "DNAT-правил в nat" "${#_rules[@]}"
++
++    # lock
++    if [[ -f "$LOCK_FILE" ]]; then
++        _diag_line "WARN" "Lock-файл" "$LOCK_FILE существует (проверьте, не запущен ли процесс)"
++    else
++        _diag_line "OK" "Lock-файл" "свободен"
++    fi
++
++    echo "---------------------------------------------------------------"
++    if [[ $_rc -eq 0 ]]; then
++        echo "Итог: критичных проблем не найдено"
++    else
++        echo "Итог: есть проблемы (см. FAIL выше)"
++    fi
++    return $_rc
+ }
+ 
+ main() {
++    local _cmd="${1:-}"
++
++    case "$_cmd" in
++        --help|-h|help)
++            usage
++            return 0
++            ;;
++        --version|-V|version)
++            print_version
++            return 0
++            ;;
++        list)
++            check_bash_version
++            cli_list "${2:-}"
++            return $?
++            ;;
++        diag)
++            check_bash_version
++            cli_diag
++            return $?
++            ;;
++        "" )
++            : # интерактивный режим
++            ;;
++        *)
++            echo -e "${RED}Неизвестная команда: $_cmd${NC}" >&2
++            echo >&2
++            usage >&2
++            return 2
++            ;;
++    esac
++
+     check_bash_version
+     trap 'echo -e "${RED}Прерывание...${NC}"; exit 130' INT
+     trap 'cleanup' EXIT
+     check_root
+     acquire_lock
+     prepare_system
+-    clear
++    clear 2>/dev/null || true
+     echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+-    echo -e "${GREEN}║     IPTABLES FORWARDING MANAGER v1.0                          ║${NC}"
++    echo -e "${GREEN}║     IPTABLES FORWARDING MANAGER v${SCRIPT_VERSION}                   ║${NC}"
+     echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
+     echo -e "${YELLOW}Лог: $LOG_FILE${NC}\n${YELLOW}Бэкапы: $BACKUP_DIR${NC}"
+     sleep 1
+     show_menu
+ }
+ 
+-main "$@"
++# Точка входа: при source (тесты) main не запускается
++if [[ "${_IPFORWARD_SOURCED:-0}" -eq 0 ]]; then
++    main "$@"
++fi
