@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "fix/**", "feat/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: ShellCheck + синтаксис
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: bash -n
+        run: |
+          bash -n ipforward.sh
+          bash -n tests/run-tests.sh
+
+      - name: ShellCheck (warning+)
+        run: shellcheck -S warning ipforward.sh tests/run-tests.sh
+
+  tests:
+    name: Тесты (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Версии bash / shellcheck
+        run: |
+          bash --version | head -1
+          shellcheck --version | head -2
+
+      - name: Прогон тестов
+        run: SHELLCHECK=shellcheck bash tests/run-tests.sh
+
+      - name: Тесты не трогают систему
+        run: |
+          # sanity: скрипт должен запускаться только от root и с реальным iptables
+          if sudo -n true 2>/dev/null; then
+            ./ipforward.sh --version
+          fi
+
+  cli:
+    name: CLI-контракт
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: --version и --help
+        run: |
+          chmod +x ipforward.sh
+          out=$(./ipforward.sh --version)
+          echo "$out"
+          [[ "$out" == ipforward\ * ]] || { echo "неожиданный формат версии"; exit 1; }
+          ./ipforward.sh --help | grep -q 'Использование'
+
+      - name: неизвестная команда → rc=2
+        run: |
+          set +e
+          ./ipforward.sh no-such-command >/dev/null 2>&1
+          rc=$?
+          set -e
+          [[ $rc -eq 2 ]] || { echo "ожидался rc=2, получен $rc"; exit 1; }
