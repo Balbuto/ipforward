@@ -1,0 +1,127 @@
+name: Bug report
+description: Сообщить о воспроизводимой проблеме в ipforward
+title: "[bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо за отчёт! Пожалуйста, заполните поля ниже — это ускорит разбор.
+
+        ⚠️ **Проблемы безопасности не публикуйте здесь** — см. [SECURITY.md](https://github.com/Balbuto/ipforward/blob/main/SECURITY.md).
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Предварительные проверки
+      options:
+        - label: Я прочитал(а) README и docs/AUDIT.md
+          required: true
+        - label: Я проверил(а), что проблема воспроизводится на версии 1.1.0 из main
+          required: true
+        - label: Я удалил(а) из вывода приватные данные (IP, домены, ключи)
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: Что произошло
+      description: Опишите поведение и то, что вы ожидали увидеть.
+      placeholder: Запустил пункт 4 (WireGuard Full), после сбоя UDP правило TCP не должно оставаться...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Шаги воспроизведения
+      value: |
+        1. `sudo ipforward`
+        2. Выбрать пункт ...
+        3. Ввести ...
+        4. ...
+      render: markdown
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Вывод и логи
+      description: |
+        Приложите вывод команд ниже, предварительно скрыв приватные данные.
+        Лог: `/var/log/port-forwarding.log`
+      value: |
+        ```
+        $ sudo ipforward --version
+        $ sudo ipforward diag
+        $ sudo iptables -t nat -L PREROUTING -n -v
+        $ tail -50 /var/log/port-forwarding.log
+        ```
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Версия ipforward
+      placeholder: "1.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: distro
+    attributes:
+      label: Дистрибутив и ядро
+      placeholder: "Debian 12, 6.1.0-18-amd64"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend iptables
+      options:
+        - legacy
+        - nftables
+        - не знаю
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Режим работы
+      options:
+        - Интерактивное меню
+        - CLI (list / diag / --version)
+        - Прямой вызов функции (source)
+    validations:
+      required: true
+
+  - type: input
+    id: menu-item
+    attributes:
+      label: Пункт меню / функция
+      placeholder: "4) WireGuard Full — configure_both_rule"
+
+  - type: dropdown
+    id: container
+    attributes:
+      label: Среда
+      options:
+        - Обычный VPS / железо
+        - LXC / OpenVZ
+        - Docker / Podman контейнер
+        - KVM с virtio
+        - другое
+
+  - type: checkboxes
+    id: tests
+    attributes:
+      label: Локальные тесты
+      description: Если клонировали репозиторий — приложите результат.
+      options:
+        - label: "`bash tests/run-tests.sh` проходит у меня на машине"
+        - label: "`shellcheck -S warning ipforward.sh` чистый"

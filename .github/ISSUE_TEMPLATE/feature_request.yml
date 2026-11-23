@@ -1,0 +1,60 @@
+name: Feature request
+description: Предложить улучшение или новую возможность
+title: "[feat]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Опишите задачу, а не готовое решение — так проще подобрать правильную реализацию.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую проблему это решает
+      description: Что сейчас неудобно или невозможно?
+      placeholder: Хочу добавлять правила из Ansible, но CLI умеет только list и diag.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Предлагаемое поведение
+      description: Как это должно выглядеть для пользователя (команда, меню, вывод).
+      placeholder: |
+        ipforward add --proto udp --port 51820 --dest 203.0.113.50:51820 --yes
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Альтернативы
+      description: Что вы пробовали или рассматривали (другие инструменты, обходные пути).
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Область
+      options:
+        - CLI
+        - Интерактивное меню
+        - Правила iptables / NAT
+        - Бэкапы и восстановление
+        - Персистентность
+        - Тесты и CI
+        - Документация
+        - Другое
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Ограничения проекта
+      description: Скрипт должен оставаться одним bash-файлом без обязательных внешних зависимостей.
+      options:
+        - label: Предложение реализуемо на bash 4.3 без новых обязательных зависимостей
+          required: true
+        - label: Я готов(а) отправить PR
