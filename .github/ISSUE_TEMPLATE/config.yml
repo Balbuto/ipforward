@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Документация и аудит
+    url: https://github.com/Balbuto/ipforward/blob/main/docs/AUDIT.md
+    about: Разбор дефектов 1.0 и что изменено в 1.1.0
+  - name: Правила безопасности
+    url: https://github.com/Balbuto/ipforward/blob/main/SECURITY.md
+    about: Как сообщить об уязвимости (не через публичный issue)
+  - name: Участие в разработке
+    url: https://github.com/Balbuto/ipforward/blob/main/CONTRIBUTING.md
+    about: Как собрать окружение, прогнать тесты и оформить PR
